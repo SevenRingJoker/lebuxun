@@ -1,0 +1,252 @@
+/* ScholarTreaCode 全局样式：白 / 黑 / 蓝 三套主题变量 */
+
+/*
+ * s54 UI 重设计 token 层（2026-10-03）：
+ * - 中性深色基底 #18181C，面板 #1F1F24，悬浮 #2A2A30，边框 #2E2E36
+ * - 文本主 #E2E2E5 / 次 #8B8B94 / 禁用 #52525B
+ * - 品牌色 primary #6366F1（靛蓝），仅用于高亮/按钮
+ * - 语义色 success #10B981 / warn #F59E0B / danger #EF4444；错误柔和态用 #F87171
+ * - 间距 4px/8px 网格，圆角 sm 6px / md 8px
+ * 为避免一次性断崖式替换，保留旧变量名（--bg-primary/--accent/--border 等）并把值重设为新方案，
+ * 同时新增新语义别名指向同一值。组件逐步迁移到新名字。
+ */
+
+/* ---------- 蓝色主题（默认，现代中性深 + 靛蓝品牌） ---------- */
+:root,
+:root[data-theme='blue'] {
+  color-scheme: dark;
+  /* 跨平台等宽字体栈 */
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Source Code Pro',
+    'Menlo', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono',
+    'Consolas', 'Courier New', monospace;
+  /* 通用 sans 字体栈（界面正文用，等宽留给代码区） */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', 'Noto Sans CJK SC', 'Helvetica Neue', Arial, sans-serif;
+
+  /* === 背景层 === */
+  --bg-base: #18181C;       /* 主背景（最外层） */
+  --bg-primary: #18181C;    /* 旧名兼容 = bg-base */
+  --bg-panel: #1F1F24;      /* 侧边栏/AI面板/卡片 */
+  --bg-secondary: #1F1F24;  /* 旧名兼容 = bg-panel */
+  --bg-hover: #2A2A30;      /* 鼠标移入 */
+  --bg-tertiary: #2A2A30;   /* 旧名兼容 = bg-hover */
+  --bg-elevated: #25252B;   /* 浮层（下拉/弹窗） */
+
+  /* === 边框 === */
+  --border-color: #2E2E36;  /* 极细 1px 分割线 */
+  --border: #2E2E36;        /* 旧名兼容 */
+  --border-light: #3A3A42;  /* 略亮的边框 */
+  --border-glow: rgba(99, 102, 241, 0.30);
+
+  /* === 文本 === */
+  --text-primary: #E2E2E5;  /* 主文本 */
+  --text-secondary: #8B8B94;/* 次要文本 */
+  --text-muted: #52525B;    /* 禁用/占位文本 */
+
+  /* === 品牌色 === */
+  --primary: #6366F1;       /* 靛蓝品牌色 */
+  --primary-hover: #818CF8;
+  --primary-dim: rgba(99, 102, 241, 0.12);
+  --accent: #6366F1;        /* 旧名兼容 = primary */
+  --accent-hover: #818CF8;
+  --accent-dim: rgba(99, 102, 241, 0.12);
+  --selection-bg: rgba(99, 102, 241, 0.22);
+  --btn-primary-text: #FFFFFF;
+
+  /* === 语义色（仅小图标/胶囊，不大面积使用） === */
+  --success: #10B981;
+  --warning: #F59E0B;
+  --danger: #EF4444;
+  --danger-soft: #F87171;   /* 柔和错误（暗色底上不刺眼） */
+  --success-dim: rgba(16, 185, 129, 0.12);
+  --warning-dim: rgba(245, 158, 11, 0.12);
+  --danger-dim: rgba(239, 68, 68, 0.12);
+
+  /* === 间距（4/8 网格） === */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* === 圆角 === */
+  --radius-sm: 6px;   /* 按钮/输入框 */
+  --radius-md: 8px;   /* 面板卡片 */
+  --radius-lg: 12px;
+
+  /* === 工具气泡 === */
+  --tool-bubble-bg: rgba(99, 102, 241, 0.12);
+
+  /* === 滚动条 === */
+  --scrollbar-thumb: #3A3A42;
+
+  /* === 外壳氛围（低饱和，不喧宾夺主） === */
+  --shell-bg: #18181C;
+  --topbar-bg: #1F1F24;
+  --topbar-shadow: 0 1px 0 rgba(255, 255, 255, 0.04), 0 4px 12px rgba(0, 0, 0, 0.25);
+  --logo-shadow: none;
+}
+
+/* ---------- 黑色主题（纯深黑） ---------- */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg-primary: #04060A;
+  --bg-secondary: #0A0E15;
+  --bg-tertiary: #10151F;
+  --bg-panel: #070A11;
+  --bg-hover: #161D2B;
+  --border: #1A2230;
+  --border-light: #28324A;
+  --border-glow: rgba(99, 102, 241, 0.28);
+  --text-primary: #E6EBF2;
+  --text-secondary: #93A0B5;
+  --text-muted: #637089;
+  --accent: #6366F1;
+  --accent-hover: #818CF8;
+  --accent-dim: rgba(99, 102, 241, 0.1);
+  --selection-bg: rgba(99, 102, 241, 0.2);
+  --scrollbar-thumb: #1E2735;
+  --shell-bg: #04060A;
+  --topbar-bg: #0C1119;
+  --topbar-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  --logo-shadow: 0 0 10px rgba(99, 102, 241, 0.5);
+  --tool-bubble-bg: rgba(99, 102, 241, 0.12);
+  --btn-primary-text: #FFFFFF;
+  --success: #10B981;
+  --danger: #EF4444;
+  --warning: #F59E0B;
+}
+
+/* ---------- 白色主题（亮色） ---------- */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg-primary: #F4F7FB;
+  --bg-secondary: #FFFFFF;
+  --bg-tertiary: #EDF1F7;
+  --bg-panel: #FFFFFF;
+  --bg-hover: #E4EAF3;
+  --border: #D3DCE9;
+  --border-light: #B7C4D8;
+  --border-glow: rgba(2, 136, 199, 0.25);
+  --text-primary: #1B2435;
+  --text-secondary: #45546B;
+  --text-muted: #7B8AA3;
+  --accent: #0288C7;
+  --accent-hover: #036FA3;
+  --accent-dim: rgba(2, 136, 199, 0.1);
+  --selection-bg: rgba(2, 136, 199, 0.18);
+  --scrollbar-thumb: #C2CDDD;
+  --shell-bg:
+    radial-gradient(1200px 500px at 80% -10%, rgba(2, 136, 199, 0.06), transparent 60%),
+    radial-gradient(900px 400px at 10% 110%, rgba(59, 130, 246, 0.05), transparent 60%),
+    #F4F7FB;
+  --topbar-bg: linear-gradient(180deg, #FFFFFF 0%, #E9EFF7 100%);
+  --topbar-shadow: 0 1px 0 rgba(2, 136, 199, 0.15), 0 2px 10px rgba(27, 36, 53, 0.08);
+  --logo-shadow: 0 0 8px rgba(2, 136, 199, 0.35);
+  --tool-bubble-bg: rgba(2, 136, 199, 0.1);
+  --btn-primary-text: #FFFFFF;
+  --success: #059669;
+  --danger: #DC2626;
+  --warning: #D97706;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 文本选中颜色跟随主题 */
+::selection {
+  background: var(--selection-bg);
+  color: var(--text-primary);
+}
+
+/* 细滚动条（4px，符合设计规范） */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* 通用玻璃面板（卡片化：bg-panel + 边框 + 圆角 8） */
+.cp-glass {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+/* 通用按钮 */
+.cp-btn {
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  transition: all 0.15s;
+}
+.cp-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+.cp-btn:active {
+  transform: translateY(1px);
+}
+.cp-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--btn-primary-text);
+  font-weight: 600;
+}
+.cp-btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--btn-primary-text);
+  box-shadow: 0 0 12px var(--border-glow);
+}
+
+/* ---------- 调试断点 / 命中行 ---------- */
+.debug-bp-glyph {
+  background: #EF4444;
+  border-radius: 50%;
+  width: 10px !important;
+  height: 10px !important;
+  margin-left: 4px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+.debug-bp-glyph:hover {
+  background: #F87171;
+}
+.debug-hit-line {
+  background: rgba(234, 179, 8, 0.15);
+  border-left: 3px solid #EAB308;
+}
+.debug-hit-glyph {
+  background: #EAB308;
+  border-radius: 50%;
+  width: 10px !important;
+  height: 10px !important;
+  margin-left: 4px;
+  margin-top: 4px;
+}

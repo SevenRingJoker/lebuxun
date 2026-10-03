@@ -1,0 +1,30 @@
+{
+  "id": "example-llm",
+  "name": "示例 LLM 插件",
+  "version": "1.0.0",
+  "description": "演示插件清单格式：贡献一个 OpenAI 兼容 Provider 和一个 MCP server",
+  "author": "scholarTreaCode",
+  "enabled": true,
+  "providers": [
+    {
+      "id": "example-llm",
+      "name": "示例 LLM 端点",
+      "baseUrl": "http://localhost:8080/v1",
+      "type": "openai-compatible"
+    }
+  ],
+  "mcpServers": {
+    "example-tools": {
+      "command": "node",
+      "args": ["server.js"],
+      "description": "示例工具集"
+    }
+  },
+  "commands": [
+    {
+      "id": "example.hello",
+      "title": "示例：Hello",
+      "keybinding": "ctrl+shift+h"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "package": "@modelcontextprotocol/server-filesystem",
+      "args": ["."],
+      "description": "本地文件系统访问，允许 AI 读写项目文件（使用本地 node_modules 中的 server，离线启动；参数 '.' 自动解析为项目根目录）"
+    }
+  }
+}

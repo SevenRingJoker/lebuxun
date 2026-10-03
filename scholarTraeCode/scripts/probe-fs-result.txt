@@ -1,0 +1,10 @@
+node: v20.18.3
+cwd: D:\47.104.20.186\aiProject
+argv: ["D:\\47.104.20.186\\aiProject\\scholarTreaCode\\node_modules\\electron\\dist\\electron.exe","d:\\47.104.20.186\\aiProject\\scholarTreaCode\\scripts\\probe-fs.cjs"]
+[realpath 工作区] OK "D:\\编辑器测试项目"
+[realpath 应用目录] OK "D:\\47.104.20.186\\aiProject\\scholarTreaCode"
+[mkdir recursive 中文] OK "D:\\编辑器测试项目\\ep-probe1"
+[mkdir plain 中文] OK 
+[mkdir recursive 应用目录] OK "D:\\47.104.20.186\\aiProject\\scholarTreaCode\\ep-probe3"
+[拼接路径] "D:\\编辑器测试项目\\ep-probe4"
+[server 链路模拟] OK

@@ -1,0 +1,11 @@
+{
+  "protectedPaths": [
+    "src/core/engine.ts"
+  ],
+  "protectedSymbols": [
+    {
+      "name": "engine"
+    }
+  ],
+  "notes": "核心模块冻结"
+}
