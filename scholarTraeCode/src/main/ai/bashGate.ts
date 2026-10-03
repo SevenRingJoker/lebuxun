@@ -246,6 +246,23 @@ export function gateBashCommand(cmd: string, ctx: BashGateContext): BashGateVerd
     }
   }
 
+  // —— 2.5 全局安装禁令：画像声明的全局安装命令一律硬拦（任何场景生效）——
+  // 全局安装污染用户环境且依赖不落入项目本地（npm install -g 不匹配 initPattern，
+  // 不会置 ranNpmInstall，但命令本身会真实执行成功）。话术层（S8 纪律/重试话术）
+  // 已宣称「绝对禁止」，此处补齐门控硬约束，保持言行一致。
+  for (const profile of [NODE_GATE_PROFILE, ...MANIFEST_GATE_PROFILES]) {
+    const hit = profile.forbidGlobalInstall.find((g) => g && command.includes(g))
+    if (hit) {
+      return {
+        kind: 'deny',
+        message:
+          `错误：【前置校验失败】禁止全局安装依赖（命中禁令：${hit}）。` +
+          '全局安装会污染用户环境，且依赖不会进入项目本地目录，项目运行时仍然缺包。' +
+          '请改用项目本地安装：在依赖声明文件（如 package.json）中声明依赖后执行本地安装命令。'
+      }
+    }
+  }
+
   // 第三层：项目画像驱动的通用顺序锁（替代原写死的 npm 分支 + 依赖图谱）
   // —— 3a. node 生态（npm/yarn）：调度器显式磁盘探测时任何场景生效；未探测时回退项目创建旧行为 ——
   const nodeBlock = checkCommandOrder(command, NODE_GATE_PROFILE, ctx.createdFiles, {

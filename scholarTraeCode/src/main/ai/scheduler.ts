@@ -11,7 +11,7 @@ import { getCachedModels, getProvider, parseModelId, refreshModels } from './pro
 import { collectTools, callMcpTool, listMcpServers, type McpToolEntry } from '../handlers/mcpToolBridge'
 import { buildAgentPrompt, buildAgentsMd, buildRulesMd, renderNotes, type PromptContext } from './promptBuilder'
 import { dirname, relative, sep, extname, resolve, isAbsolute, join } from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 // s42 改动影响提醒 + s43 spec 锚点拦截（规则在纯函数层，本文件只做挂接）
 import { buildEditImpact, formatEditImpact, symbolPattern } from './symbolNav'
 import { loadAnchors, matchProtectedPath, removedProtectedSymbols, formatAnchorBlock, type AnchorsFile } from './anchors'
@@ -613,6 +613,36 @@ export function checkExecStageGate(
   )
 }
 
+/**
+ * 运行命令源码前置校验（顺序锁的源码维度）：
+ * 画像声明 sourceDir 时，运行/验证命令要求源码目录已有产物——否则 dev server 必然秒退
+ * （典型：package.json 与 node_modules 就绪但 src/ 为空，npm run dev 通过依赖检查后直接崩溃）。
+ * 零 IO 纯函数：磁盘探测由调用方以 onDiskNonEmpty 注入（与 computeExecStage 的 onDisk 同款）。
+ * 返回拦截文案；放行返回 null。
+ */
+export function checkRunSourceGate(
+  cmd: string,
+  profile: ProjectProfile,
+  createdFiles: Set<string>,
+  onDiskNonEmpty?: (relDir: string) => boolean
+): string | null {
+  if (!profile.sourceDir) return null
+  const command = (cmd || '').trim()
+  if (!command) return null
+  if (!profile.runPattern?.test(command) && !profile.primaryRunPattern?.test(command)) return null
+  const srcSeg = profile.sourceDir.replace(/^\/+|\/+$/g, '').toLowerCase()
+  const inCreated = Array.from(createdFiles).some((f) => {
+    const n = f.replace(/\\/g, '/').toLowerCase()
+    return n.startsWith(srcSeg + '/') || n.includes('/' + srcSeg + '/')
+  })
+  if (inCreated || onDiskNonEmpty?.(profile.sourceDir)) return null
+  return (
+    `【前置校验失败】源码目录 ${profile.sourceDir} 为空，此时执行 ` +
+    `${command.split(/\s*[;&|]/)[0].trim()} 必然秒退。` +
+    `请先使用 write_file 创建 ${profile.sourceDir} 下的源码文件（入口文件与组件），再运行。`
+  )
+}
+
 /** 参与防抖统计的文件读写工具名 */
 const FILE_ACTION_TOOLS = new Set([
   'read',
@@ -623,6 +653,17 @@ const FILE_ACTION_TOOLS = new Set([
   'edit',
   'edit_file'
 ])
+/** 参与「不存在」黑名单的读取类工具名（read 系 + 列目录） */
+export const READ_LIKE_TOOLS = new Set(['read', 'read_file', 'read_text_file', 'list_directory'])
+/** 读取结果中「目标不存在」的判定（仅在结果以错误前缀开头时参与判定，避免误伤正文） */
+const READ_NOT_FOUND_RE = /不存在|enoent|no such file|not found|找不到|无法找到/i
+
+/** 提取读取类工具的目标路径（归一化小写正斜杠）；无路径参数返回 null */
+function readTargetOf(args: unknown): string | null {
+  const a = (args ?? {}) as Record<string, unknown>
+  const p = a.path ?? a.filePath ?? a.file_path ?? a.directory
+  return typeof p === 'string' && p ? p.replace(/\\/g, '/').toLowerCase() : null
+}
 /** 防抖窗口大小（最近 N 次文件动作）与同文件触发阈值 */
 export const FILE_ACTION_WINDOW = 6
 export const FILE_ACTION_THRESHOLD = 3
@@ -1264,6 +1305,9 @@ async function runWithTools(
   let lastContent = ''
   // 跨轮去重表：同一工具+参数成功过则拦截，避免 7B 模型空转耗尽轮次
   const executed = new Map<string, string>()
+  // 读取黑名单：read/list_directory 已确认「不存在」的路径（归一化小写正斜杠）。
+  // 命中黑名单的读取在执行前直接拦截，强制模型改用 write_file 创建；write 成功后移除。
+  const failedReadPaths = new Set<string>()
   let stallCount = 0
   let stallRestarts = 0
   // 连续"全轮 dedup 无进展"计数：达到阈值时触发验证锁或直接收尾
@@ -1832,6 +1876,24 @@ async function runWithTools(
         }
       }
 
+      // 读取黑名单硬拦：目标路径此前已确认「不存在」，禁止重复读取/列目录。
+      // AI 常陷入「read 不存在文件 → 报错 → 再读」死循环（fileActionWindow 防抖需同路径
+      // 3 次才触发，太慢）；命中即拦，唯一出路是 write_file 创建（写成功时黑名单自动移除）。
+      if (READ_LIKE_TOOLS.has(name ?? '')) {
+        const target = readTargetOf(args)
+        if (target && failedReadPaths.has(target)) {
+          const block =
+            `错误：【系统拦截】路径 ${target} 此前已确认不存在，禁止重复读取或列出该路径。` +
+            '你必须立即调用 write_file 创建它（write 会自动创建父目录）；' +
+            '如需确认项目结构，改用 glob 搜索或读取其父目录。'
+          noteFailure(replanState, 'preflightBlock', `${name} ${target}\n读取黑名单拦截`)
+          events?.onToolCall?.(name, args)
+          convo.push({ role: 'tool', content: block, name } as AiMessage)
+          events?.onToolResult?.(name, block)
+          continue
+        }
+      }
+
       // bash 执行前门控：破坏命令 deny / 交互式命令 interactive / 项目创建顺序锁
       const isBashTool = name === 'bash' || name === 'run_terminal_command'
 
@@ -1855,13 +1917,24 @@ async function runWithTools(
             : undefined
         })
         const stageDeny = checkExecStageGate(cmd, stage, profile)
-        if (stageDeny) {
+        // 顺序锁源码维度：运行/验证命令要求源码目录已有产物（createdFiles 登记或磁盘非空
+        // 双通道——续跑/换候选模型后登记丢失时由磁盘探测兜底）。否则 package.json +
+        // node_modules 就绪但 src/ 为空时 dev server 必然秒退（此前门控对此放行）。
+        const srcDeny =
+          stageDeny ??
+          checkRunSourceGate(cmd, profile, ctx.createdFiles, (relDir) =>
+            workspace
+              ? dirNonEmpty(join(workspace, relDir)) ||
+                (ctx.targetDir ? dirNonEmpty(join(workspace, ctx.targetDir, relDir)) : false)
+              : false
+          )
+        if (srcDeny) {
           // 软拦截：文件未齐是 files 阶段正常态，不触发 drift 硬阻断——记失败信号
           // （连续 2 次触发 Self-Reflection 重规划），让模型回去继续写文件。
-          noteFailure(replanState, 'preflightBlock', `${cmd}\n${stageDeny}`)
+          noteFailure(replanState, 'preflightBlock', `${cmd}\n${srcDeny}`)
           events?.onToolCall?.(name, args)
-          convo.push({ role: 'tool', content: stageDeny, name } as AiMessage)
-          events?.onToolResult?.(name, stageDeny)
+          convo.push({ role: 'tool', content: srcDeny, name } as AiMessage)
+          events?.onToolResult?.(name, srcDeny)
           continue
         }
       }
@@ -2131,11 +2204,20 @@ async function runWithTools(
       // 写入成功后登记 path 级去重键，拦截后续同路径重写
       if (writePath && !result.startsWith('错误') && !result.startsWith('Error')) {
         executed.set(writePath, result)
+        // 文件已创建：从读取黑名单移除（此前「不存在」的判定已失效，允许后续读取）
+        const written = readTargetOf(args)
+        if (written) failedReadPaths.delete(written)
       }
       // 重规划信号追踪：bash/run_terminal_command 用强失败标志（非零退出码、npm ERR!、
       // ELIFECYCLE 等，避开「0 failed」这类成功文本）；其余工具以「错误」前缀判定；
       // 实质成功即重置连续失败计数。
       const startsWithError = /^错误|^Error/.test(result)
+      // 读取类工具失败且目标「不存在」→ 加入读取黑名单：后续对同路径的 read/list_directory
+      // 在执行前直接拦截（见批次循环前置门），强制模型转向 write_file 创建。
+      if (READ_LIKE_TOOLS.has(name ?? '') && startsWithError && READ_NOT_FOUND_RE.test(result)) {
+        const target = readTargetOf(args)
+        if (target) failedReadPaths.add(target)
+      }
       if (name === 'bash' || name === 'run_terminal_command') {
         // bash 工具首行为「退出码 N」——此前 N≠0 不在强失败正则内，秒退失败对闭环不可见
         const exitLine = result.match(/^退出码\s+(\d+)/m)
@@ -2492,6 +2574,15 @@ export function hasForcedRecoveryTag(messages: AiMessage[]): boolean {
 function safeExists(p: string): boolean {
   try {
     return existsSync(p)
+  } catch {
+    return false
+  }
+}
+
+/** 目录存在且含至少一个条目（源码目录非空探测用；异常/文件路径按空处理） */
+function dirNonEmpty(p: string): boolean {
+  try {
+    return existsSync(p) && readdirSync(p).length > 0
   } catch {
     return false
   }

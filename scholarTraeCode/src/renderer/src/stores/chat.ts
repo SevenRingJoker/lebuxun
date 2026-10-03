@@ -728,6 +728,17 @@ export const useChatStore = defineStore('chat', () => {
     // 按缺失产物反推项目画像，生成该生态专属的系统强制重置话术
     const profile = detectProfileFromArtifacts(missingPaths)
     const text = buildForcedResetPrompt(profile, missingDetails)
+    // 上下文强制重置：截断被阻断任务轮次的全部后续消息（assistant 的虚假进度自述、
+    // 工具卡片、错误系统消息），只保留原始用户请求及之前的历史。
+    // 否则「我已经写过 package.json 了」这类污染记忆会随 history() 原样发给后端，
+    // 与 FORCED-RECOVERY 的「上下文已清理」话术自相矛盾。
+    // （role:'tool'/'system' 本就被 history() 过滤，真正的污染源是 assistant 自述。）
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      if (messages.value[i].role === 'user') {
+        messages.value.splice(i + 1)
+        break
+      }
+    }
     // 重试前显式清理任务级临时上下文（sendWithTools 内会再清一次，双保险）
     todos.value = []
     subagent.value = null

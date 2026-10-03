@@ -367,9 +367,10 @@ describe('preflightBash', () => {
     expect(preflightBash('npm install', ctx)).toBeNull()
   })
 
-  it('npm install -g 全局安装不受 package.json 前置限制', () => {
+  it('npm install -g 全局安装被画像禁令硬拦（不受 package.json 前置影响）', () => {
     const ctx = makeCtx({ isProjectCreation: true })
-    expect(preflightBash('npm install -g typescript', ctx)).toBeNull()
+    const msg = preflightBash('npm install -g typescript', ctx)
+    expect(msg).toContain('禁止全局安装')
   })
 })
 

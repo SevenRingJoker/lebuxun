@@ -215,8 +215,10 @@ describe('gateBashCommand - npm 顺序锁（deny）', () => {
     expect(gateBashCommand('npm install', ctx)).toBeNull()
   })
 
-  it('npm install -g 全局安装不受 package.json 限制', () => {
-    expect(gateBashCommand('npm install -g typescript', makeCtx())).toBeNull()
+  it('npm install -g 全局安装被画像禁令硬拦（任何场景生效）', () => {
+    const v = gateBashCommand('npm install -g typescript', makeCtx())
+    expect(v?.kind).toBe('deny')
+    expect(v && v.kind === 'deny' ? v.message : '').toContain('禁止全局安装')
   })
 
   it('npm run serve 未 install 被拒绝', () => {
@@ -257,9 +259,11 @@ describe('gateBashCommand - NPM 硬锁（显式磁盘探测，任何场景生效
     expect(gateBashCommand('npm install', ctx)).toBeNull()
   })
 
-  it('packageJsonExists:false 不影响 npm install -g 全局安装', () => {
+  it('packageJsonExists:false 不影响 npm install -g 全局安装（但画像禁令本身硬拦）', () => {
     const ctx = makeCtx({ isProjectCreation: false, packageJsonExists: false })
-    expect(gateBashCommand('npm install -g typescript', ctx)).toBeNull()
+    const v = gateBashCommand('npm install -g typescript', ctx)
+    expect(v?.kind).toBe('deny')
+    expect(v && v.kind === 'deny' ? v.message : '').toContain('禁止全局安装')
   })
 
   it('nodeModulesExists:false：非项目创建场景 npm run build 被拒绝（任意 script 全覆盖）', () => {
