@@ -10,11 +10,11 @@ export interface DagValidationResult {
   warnings: string[]
 }
 
-/** 禁止的文件名模式：测试性/示例性文件不应出现在正式 DAG 中 */
-const FORBIDDEN_FILE_RE = /(^|\/)(example|test|temp|tmp|demo|sample)\.(txt|md|json|js|ts)$/i
+/** 禁止的文件名模式：测试性/示例性文件不应出现在正式项目中 */
+export const FORBIDDEN_FILE_RE = /(^|\/)(example|test|temp|tmp|demo|sample)\.(txt|md|json|js|ts)$/i
 
 /** 禁止的命令模式 */
-const FORBIDDEN_CMD_PATTERNS: { re: RegExp; hint: string }[] = [
+export const FORBIDDEN_CMD_PATTERNS: { re: RegExp; hint: string }[] = [
   {
     re: /\bnpm\s+(install|i)\s+[@a-z][a-z0-9-]*@[\d.]+/i,
     hint: '禁止用 npm install <pkg>@<ver> 直接装包（应通过 package.json 声明依赖后执行 npm install）'
@@ -36,6 +36,23 @@ const FORBIDDEN_CMD_PATTERNS: { re: RegExp; hint: string }[] = [
     hint: '禁止 pnpm init/create，必须用 write_file 直接写 package.json'
   }
 ]
+
+/** 工具执行层轻量检查：命中禁止文件名时返回提示文案，否则 null */
+export function findForbiddenFile(path: string): string | null {
+  if (path && FORBIDDEN_FILE_RE.test(path)) {
+    return `【禁止文件拦截】${path} 属于测试性文件，禁止写入。项目只允许创建标准结构文件（package.json、src/main.js 等）。`
+  }
+  return null
+}
+
+/** 工具执行层轻量检查：命中禁止命令时返回提示文案，否则 null */
+export function findForbiddenCommand(cmd: string): string | null {
+  if (!cmd) return null
+  for (const { re, hint } of FORBIDDEN_CMD_PATTERNS) {
+    if (re.test(cmd)) return `【禁止命令拦截】${hint}（命令: ${cmd}）`
+  }
+  return null
+}
 
 /**
  * 从 ProjectProfile 推断关键文件列表（用于检查 DAG 是否包含必要的 write_file 节点）

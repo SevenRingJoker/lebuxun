@@ -11,7 +11,7 @@ import { getCachedModels, getProvider } from './providerRegistry'
 import { collectTools, callMcpTool, listMcpServers, type McpToolEntry } from '../handlers/mcpToolBridge'
 import { buildAgentPrompt, buildAgentsMd, buildRulesMd, renderNotes, type PromptContext } from './promptBuilder'
 import { dirname, relative, sep, extname, resolve, isAbsolute, join } from 'node:path'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
 // s42 改动影响提醒 + s43 spec 锚点拦截（规则在纯函数层，本文件只做挂接）
 import { buildEditImpact, formatEditImpact, symbolPattern } from './symbolNav'
 import { loadAnchors, matchProtectedPath, removedProtectedSymbols, formatAnchorBlock, type AnchorsFile } from './anchors'
@@ -72,7 +72,7 @@ import {
 } from '../../shared/projectProfiles'
 import { getTemplate } from './validationTemplates'
 import { FAST_FAIL_BREAKER_TAG } from '../terminal/commandError'
-import { validateDagStatic } from './dagValidator'
+import { validateDagStatic, findForbiddenFile, findForbiddenCommand } from './dagValidator'
 import { gateBashCommand, gateBashMessage, type BashGateContext } from './bashGate'
 import { runInteractiveInPty } from '../handlers/ptyManager'
 import {
@@ -435,6 +435,39 @@ export function isProjectCreation(messages: AiMessage[]): boolean {
     return /(创建|新建|建|生成|初始化).*(项目|工程|vue|react|app|application|express|koa|next|nuxt|脚手架|scaffold)/i.test(messages[i].content)
   }
   return false
+}
+
+/** 历史失败运行残留的测试性垃圾文件白名单（精确文件名，只删 txt，避免误删合法代码） */
+const LEFTOVER_JUNK_FILES = ['example.txt', 'test.txt', 'temp.txt', 'tmp.txt', 'demo.txt', 'sample.txt']
+
+/**
+ * 项目创建任务启动前清理历史残留：扫描工作区根目录与一级子目录（覆盖 vue2-project/ 这类目标子目录），
+ * 删除白名单内的垃圾文件。node_modules 与点开头目录跳过。删除失败/目录不可读均不阻断主流程。
+ */
+function cleanupLeftoverJunk(workspace: string): void {
+  const tryRemove = (dir: string): void => {
+    for (const name of LEFTOVER_JUNK_FILES) {
+      const p = join(dir, name)
+      if (existsSync(p)) {
+        try {
+          unlinkSync(p)
+          console.log(`[TraeCode] 清理历史残留文件：${p}`)
+        } catch {
+          // 文件被占用或无权限：跳过，不阻断任务启动
+        }
+      }
+    }
+  }
+  try {
+    tryRemove(workspace)
+    for (const entry of readdirSync(workspace, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name !== 'node_modules' && !entry.name.startsWith('.')) {
+        tryRemove(join(workspace, entry.name))
+      }
+    }
+  } catch {
+    // 工作区目录不可读时跳过清理
+  }
 }
 
 /**
@@ -885,6 +918,8 @@ export async function scheduleChatWithTools(
   // 规划阶段：项目创建请求先用 reasoning 模型生成详细计划
   let plan: string | null = null
   if (tools.length > 0 && isProjectCreation(strippedMessages)) {
+    // 启动前清理历史失败运行残留的测试性垃圾文件（example.txt / test.txt 等）
+    if (params.workspace) cleanupLeftoverJunk(params.workspace)
     plan = await generatePlan(strippedMessages, params.workspace, events, environmentReport, recommendedSkillNames, signal)
     // 二期：解析 plan 文本末尾的 manifest 代码块，成功则写入会话单例（影响收尾校验）
     if (plan) {
@@ -1173,6 +1208,8 @@ async function runWithTools(
     cachedModels.filter((m) => m.available).map((m) => m.id)
   )
   if (threeModelMode) {
+    // 项目创建请求：启动前清理历史失败运行残留的测试性垃圾文件
+    if (params.workspace && isProjectCreation(strippedMessages)) cleanupLeftoverJunk(params.workspace)
     // 三模型模式：先切到 Planner 生成 DAG，再切回 Executor 执行
     const userText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
     const profile = detectProfileFromText(userText)
@@ -1497,6 +1534,10 @@ async function runWithTools(
   }
   // 文件动作防抖窗口（同文件 read/write/edit 混排死循环检测）：最近 6 次动作中同路径 ≥3 次触发强制重启
   let fileActionWindow: string[] = []
+  // 同命令防抖：60 秒窗口内同命令执行 2 次后，第 3 次直接拦截（防止 npm run dev 秒退死循环）
+  const commandHistory = new Map<string, number[]>()
+  const CMD_THROTTLE_WINDOW_MS = 60_000
+  const CMD_THROTTLE_THRESHOLD = 2
 
   // Agent 执行轨迹录制：traceDir 传入时记录每轮模型/工具调用与耗时，结束后落盘
   const log = getLogger('scheduler')
@@ -1895,6 +1936,59 @@ async function runWithTools(
             break
           }
         }
+      }
+
+      // 禁止文件拦截（与 DAG 静态审查同源）：example/test/temp 等测试性文件禁止写入，
+      // 防止模型自由发挥污染标准项目结构
+      if (name === 'write' || name === 'write_file') {
+        const toolPath = String(args?.path ?? '').replace(/\\/g, '/')
+        const forbidden = findForbiddenFile(toolPath)
+        if (forbidden) {
+          const block = `错误：${forbidden}`
+          noteFailure(replanState, 'preflightBlock', block)
+          events?.onToolCall?.(name, args)
+          convo.push({ role: 'tool', content: block, name } as AiMessage)
+          events?.onToolResult?.(name, block)
+          continue
+        }
+      }
+
+      // 禁止命令拦截：直接装包（npm i pkg@ver）/ npm init / 全局安装，必须走 package.json 声明依赖
+      if (name === 'bash' || name === 'run_terminal_command' || name === 'start_background_task') {
+        const forbidden = findForbiddenCommand(cmd)
+        if (forbidden) {
+          const block = `错误：${forbidden}`
+          noteFailure(replanState, 'preflightBlock', block)
+          events?.onToolCall?.(name, args)
+          convo.push({ role: 'tool', content: block, name } as AiMessage)
+          events?.onToolResult?.(name, block)
+          continue
+        }
+      }
+
+      // 同命令防抖：start_background_task / run_terminal_command / bash 在 60s 窗口内
+      // 执行达到阈值后直接拦截（典型：npm run dev 连续秒退仍被反复调用）
+      if (
+        (name === 'start_background_task' || name === 'run_terminal_command' || name === 'bash') &&
+        cmd
+      ) {
+        const nowTs = Date.now()
+        const recent = (commandHistory.get(cmd) ?? []).filter(
+          (t) => nowTs - t < CMD_THROTTLE_WINDOW_MS
+        )
+        if (recent.length >= CMD_THROTTLE_THRESHOLD) {
+          const block =
+            `错误：【防抖拦截】命令 "${cmd}" 在 60 秒内已被执行 ${recent.length} 次且均秒退，判定为死循环，禁止重复执行。` +
+            '请立即 read_file 或 list_directory 定位缺失的依赖/配置，修复后再尝试。'
+          noteFailure(replanState, 'preflightBlock', block)
+          events?.onToolCall?.(name, args)
+          convo.push({ role: 'tool', content: block, name } as AiMessage)
+          events?.onToolResult?.(name, block)
+          batchInterrupted = true
+          break
+        }
+        recent.push(nowTs)
+        commandHistory.set(cmd, recent)
       }
 
       // targetDir 工作区限定：plan 指定子目录后，文件变更禁止落在父目录（根目录与子目录混写污染源）。
@@ -3071,6 +3165,40 @@ let currentTaskManifest: ArtifactManifest | null = null
 let currentTaskCtx: PromptContext | null = null
 
 /**
+ * 把 createdFiles 归一化为「相对 targetDir（其次相对 workspace）」的路径集合，
+ * 供验证锁 fileExists 规则精确/后缀匹配。覆盖三种历史存储形态：
+ *  1. 绝对路径 D:\ws\vue2-project\package.json → package.json
+ *  2. 带子目录前缀 vue2-project/src/main.js      → src/main.js
+ *  3. 已是相对路径 package.json / src/main.js     → 原样保留
+ * 纯字符串处理（零 IO），大小写不敏感地剥离前缀。
+ */
+function normalizeCreatedFilesForValidation(
+  files: Set<string>,
+  workspace?: string | null,
+  targetDir?: string | null
+): Set<string> {
+  const toFwd = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  const ws = workspace ? toFwd(workspace) : ''
+  const td = targetDir ? toFwd(targetDir) : ''
+  const stripPrefix = (p: string, prefix: string): string => {
+    if (!prefix) return p
+    return p.toLowerCase().startsWith(prefix.toLowerCase() + '/')
+      ? p.slice(prefix.length + 1)
+      : p
+  }
+  const out = new Set<string>()
+  for (const raw of files) {
+    let p = toFwd(raw)
+    // 绝对路径先剥离工作区根（d:/ws/vue2-project/x.js → vue2-project/x.js）
+    if (ws) p = stripPrefix(p, ws)
+    // 再剥离 targetDir 前缀（vue2-project/package.json → package.json）
+    if (td) p = stripPrefix(p, td)
+    out.add(p)
+  }
+  return out
+}
+
+/**
  * 取当前会话的 manifest + 适配后的 ValidationContext 快照。
  * 任务未运行时 ctx 为 null；运行中返回的 ctx.createdFiles 与 scheduler 内部共享同一 Set，实时反映进度。
  */
@@ -3085,20 +3213,8 @@ export function getValidationState(): {
   if (ctx.ranNpmInstall) executedCommands.set('npm install', '')
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
-  // 路径归一化：与 validateTaskCompletion 保持一致，确保前端看到的 createdFiles 与验证层一致
-  const targetDir = ctx.targetDir
-  const createdFiles = targetDir
-    ? new Set(
-        Array.from(ctx.createdFiles).map((p) => {
-          const norm = p.replace(/\\/g, '/')
-          const td = targetDir.replace(/\\/g, '/')
-          if (norm.includes('/') && !norm.startsWith(td + '/')) {
-            return norm
-          }
-          return `${td}/${norm}`
-        })
-      )
-    : ctx.createdFiles
+  // 路径归一化：与 validateTaskCompletion 同源，前端面板与验证层看到的路径一致
+  const createdFiles = normalizeCreatedFilesForValidation(ctx.createdFiles, ctx.workspace, ctx.targetDir)
   return {
     manifest: currentTaskManifest,
     ctx: {
@@ -3132,22 +3248,9 @@ export function validateTaskCompletion(ctx: PromptContext): string | null {
   if (ctx.ranNpmInstall) executedCommands.set('npm install', '')
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
-  // 路径归一化：如果 targetDir 存在，把相对路径拼接为 targetDir 前缀路径，
-  // 确保验证层能正确识别 vue2-project/package.json 等子目录文件
-  const targetDir = ctx.targetDir
-  const createdFiles = targetDir
-    ? new Set(
-        Array.from(ctx.createdFiles).map((p) => {
-          const norm = p.replace(/\\/g, '/')
-          const td = targetDir.replace(/\\/g, '/')
-          // 如果路径已包含 targetDir 前缀或是绝对路径，保持原样
-          if (norm.includes('/') && !norm.startsWith(td + '/')) {
-            return norm
-          }
-          return `${td}/${norm}`
-        })
-      )
-    : ctx.createdFiles
+  // 路径归一化：剥离 workspace/targetDir 前缀，得到 manifest 相对路径（package.json、src/main.js），
+  // 覆盖绝对路径（DAG 模式 VFS 注入）与子目录前缀路径（文本计划模式）两种形态
+  const createdFiles = normalizeCreatedFilesForValidation(ctx.createdFiles, ctx.workspace, ctx.targetDir)
   const vctx: ValidationContext = {
     createdFiles,
     executedCommands,
