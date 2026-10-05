@@ -72,6 +72,7 @@ import {
 } from '../../shared/projectProfiles'
 import { getTemplate } from './validationTemplates'
 import { FAST_FAIL_BREAKER_TAG } from '../terminal/commandError'
+import { validateDagStatic } from './dagValidator'
 import { gateBashCommand, gateBashMessage, type BashGateContext } from './bashGate'
 import { runInteractiveInPty } from '../handlers/ptyManager'
 import {
@@ -529,7 +530,8 @@ async function generateDagPlan(
   events?: ToolsEvents,
   environmentReport?: string,
   recommendedSkills?: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  projectProfile?: ProjectProfile | null
 ): Promise<{ ok: true; dag: TaskDag; targetDir: string | null } | { ok: false }> {
   const lastUser = strippedMessages[strippedMessages.length - 1]
   const envBlock = environmentReport ? `\n${environmentReport}` : ''
@@ -596,6 +598,16 @@ async function generateDagPlan(
     if (!parsed.ok) {
       events?.onFallback?.('dag-parse', 'plan-text', parsed.error)
       return { ok: false }
+    }
+    // DAG 静态审查：拦截非标准节点和越序命令
+    const dagValidation = validateDagStatic(parsed.dag, projectProfile ?? null, parsed.dag.targetDir ?? null)
+    if (!dagValidation.ok) {
+      console.warn('[TraeCode] DAG 静态审查未通过:', dagValidation.error)
+      events?.onFallback?.('dag', 'plan-text', `DAG 审查失败：${dagValidation.error}`)
+      return { ok: false }
+    }
+    if (dagValidation.warnings.length > 0) {
+      console.warn('[TraeCode] DAG 静态审查警告:', dagValidation.warnings)
     }
     return { ok: true, dag: parsed.dag, targetDir: parsed.dag.targetDir ?? null }
   } catch {
@@ -1162,7 +1174,9 @@ async function runWithTools(
   )
   if (threeModelMode) {
     // 三模型模式：先切到 Planner 生成 DAG，再切回 Executor 执行
-    const dagResult = await generateDagPlan(messages, workspace, events, environmentReport, undefined, signal)
+    const userText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+    const profile = detectProfileFromText(userText)
+    const dagResult = await generateDagPlan(messages, workspace, events, environmentReport, undefined, signal, profile)
     if (dagResult.ok) {
       // DAG 驱动模式：用 DAG 替代现有 plan 文本，进入 DAG 执行循环
       return runWithDag(
@@ -3071,10 +3085,24 @@ export function getValidationState(): {
   if (ctx.ranNpmInstall) executedCommands.set('npm install', '')
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
+  // 路径归一化：与 validateTaskCompletion 保持一致，确保前端看到的 createdFiles 与验证层一致
+  const targetDir = ctx.targetDir
+  const createdFiles = targetDir
+    ? new Set(
+        Array.from(ctx.createdFiles).map((p) => {
+          const norm = p.replace(/\\/g, '/')
+          const td = targetDir.replace(/\\/g, '/')
+          if (norm.includes('/') && !norm.startsWith(td + '/')) {
+            return norm
+          }
+          return `${td}/${norm}`
+        })
+      )
+    : ctx.createdFiles
   return {
     manifest: currentTaskManifest,
     ctx: {
-      createdFiles: ctx.createdFiles,
+      createdFiles,
       executedCommands,
       workspace: ctx.workspace ?? undefined
     }
@@ -3104,8 +3132,24 @@ export function validateTaskCompletion(ctx: PromptContext): string | null {
   if (ctx.ranNpmInstall) executedCommands.set('npm install', '')
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
+  // 路径归一化：如果 targetDir 存在，把相对路径拼接为 targetDir 前缀路径，
+  // 确保验证层能正确识别 vue2-project/package.json 等子目录文件
+  const targetDir = ctx.targetDir
+  const createdFiles = targetDir
+    ? new Set(
+        Array.from(ctx.createdFiles).map((p) => {
+          const norm = p.replace(/\\/g, '/')
+          const td = targetDir.replace(/\\/g, '/')
+          // 如果路径已包含 targetDir 前缀或是绝对路径，保持原样
+          if (norm.includes('/') && !norm.startsWith(td + '/')) {
+            return norm
+          }
+          return `${td}/${norm}`
+        })
+      )
+    : ctx.createdFiles
   const vctx: ValidationContext = {
-    createdFiles: ctx.createdFiles,
+    createdFiles,
     executedCommands,
     workspace: ctx.workspace ?? undefined
   }
@@ -3249,6 +3293,8 @@ async function runWithDag(
   // L4 运行时验证输入：最近一次 serve/dev/start 启动命令与输出（ranServe 置位时同步记录）
   let lastServeCmd = ''
   let lastServeOutput = ''
+  // 同命令防抖：60 秒内同命令执行 2 次后第 3 次拦截
+  const commandHistory = new Map<string, number[]>()
 
   const taskId = `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const startedAt = Date.now()
@@ -3483,6 +3529,27 @@ async function runWithDag(
           continue
         }
 
+        // 同命令防抖：60 秒内同命令执行 2 次后第 3 次拦截（防止 npm run dev 秒退死循环）
+        if ((name === 'start_background_task' || name === 'run_terminal_command' || name === 'bash') && cmd) {
+          const now = Date.now()
+          const history = commandHistory.get(cmd) ?? []
+          const recent = history.filter((t) => now - t < 60_000)
+          if (recent.length >= 2) {
+            const block =
+              `错误：【防抖拦截】命令 "${cmd}" 在 60 秒内已被执行 ${recent.length} 次且均秒退。` +
+              '判定为死循环，禁止重复执行。' +
+              '请先用 read_file 或 list_directory 定位缺失的依赖/配置，修复后再尝试。'
+            noteFailure(replanState, 'preflightBlock', block)
+            events?.onToolCall?.(name, args)
+            convo.push({ role: 'tool', content: block, name } as AiMessage)
+            events?.onToolResult?.(name, block)
+            batchInterrupted = true
+            break
+          }
+          recent.push(now)
+          commandHistory.set(cmd, recent)
+        }
+
         // 复杂度路由：write/edit 节点标记 complexity=high 时切换到 Coder 生成内容
         const matchedReadyNode = ready.find((n) => n.action === name)
         if (
@@ -3524,7 +3591,7 @@ async function runWithDag(
         if ((name === 'write' || name === 'write_file') && args?.path) {
           ctx.createdFiles.add(String(args.path))
         }
-        if (name === 'bash' || name === 'run_terminal_command') {
+        if (name === 'start_background_task' || name === 'bash' || name === 'run_terminal_command') {
           if (/\bnpm\s+(install|i|ci)\b/.test(cmd)) ctx.ranNpmInstall = true
           if (/\bnpm\s+run\s+(serve|dev|start)\b/.test(cmd)) {
             ctx.ranServe = true
@@ -3532,6 +3599,22 @@ async function runWithDag(
             lastServeCmd = cmd
             lastServeOutput = result
           }
+        }
+
+        // FAST_FAIL_BREAKER：命令 <1000ms 非零崩溃 → 立即中止当前批次，强制模型停下来修复
+        if ((name === 'bash' || name === 'run_terminal_command' || name === 'start_background_task')
+            && result.includes(FAST_FAIL_BREAKER_TAG)) {
+          noteFailure(replanState, 'commandFailure', `${cmd || name}\n秒退熔断`)
+          convo.push({ role: 'tool', content: result, name } as AiMessage)
+          events?.onToolResult?.(name, result)
+          convo.push({
+            role: 'user',
+            content:
+              '⛔ 秒退熔断：命令在 1 秒内崩溃退出，当前批次已强制中断。严格执行上方工具结果中的【致命错误】指令：' +
+              '先 read_file / list_directory 定位并修复源码（通常是文件缺失或语法错误），修复完成前禁止执行任何后续命令。'
+          } as AiMessage)
+          batchInterrupted = true
+          break
         }
       }
 

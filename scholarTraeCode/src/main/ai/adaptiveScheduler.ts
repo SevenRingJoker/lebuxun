@@ -210,14 +210,15 @@ export async function selectModelForRoleWithDiagnostics(
     }
   }
 
-  // 4. 家族偏好排序（同家族内按参数量降序，优先大模型）
+  // 4. 家族偏好排序（同家族内按参数量排序：planner/coder/observer 优先大模型，executor 优先小模型）
+  const preferLarger = role !== 'executor'
   candidates.sort((a, b) => {
     const aIdx = req.preferFamily.indexOf(a.family)
     const bIdx = req.preferFamily.indexOf(b.family)
     const aScore = aIdx === -1 ? 99 : aIdx
     const bScore = bIdx === -1 ? 99 : bIdx
     if (aScore !== bScore) return aScore - bScore
-    return b.paramSize - a.paramSize
+    return preferLarger ? b.paramSize - a.paramSize : a.paramSize - b.paramSize
   })
 
   // 5. 显存约束：从 targetCtx 递减尝试
