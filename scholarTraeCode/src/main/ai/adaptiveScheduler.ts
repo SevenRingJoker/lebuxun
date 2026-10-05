@@ -210,14 +210,14 @@ export async function selectModelForRoleWithDiagnostics(
     }
   }
 
-  // 4. 家族偏好排序（同家族内按参数量升序，省显存）
+  // 4. 家族偏好排序（同家族内按参数量降序，优先大模型）
   candidates.sort((a, b) => {
     const aIdx = req.preferFamily.indexOf(a.family)
     const bIdx = req.preferFamily.indexOf(b.family)
     const aScore = aIdx === -1 ? 99 : aIdx
     const bScore = bIdx === -1 ? 99 : bIdx
     if (aScore !== bScore) return aScore - bScore
-    return a.paramSize - b.paramSize
+    return b.paramSize - a.paramSize
   })
 
   // 5. 显存约束：从 targetCtx 递减尝试
