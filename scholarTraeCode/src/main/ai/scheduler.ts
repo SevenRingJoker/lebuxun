@@ -76,6 +76,11 @@ import { validateDagStatic } from './dagValidator'
 import { gateBashCommand, gateBashMessage, type BashGateContext } from './bashGate'
 import { runInteractiveInPty } from '../handlers/ptyManager'
 import {
+  checkForbiddenFile,
+  checkForbiddenCommand,
+  checkCommandThrottle
+} from './toolGuards'
+import {
   createReplanState,
   noteFailure,
   noteSuccess,
@@ -1934,48 +1939,37 @@ async function runWithTools(
         }
       }
 
-      // 禁止文件拦截：example/test/temp 等测试性文件禁止写入
+      // ===== 工具守卫：禁止文件 / 禁止命令 / 同命令防抖 =====
       const toolPath = String(args?.path ?? '').replace(/\\/g, '/').toLowerCase()
       const toolCmd = String(args?.command ?? '')
-      const FORBIDDEN_FILE_RE = /(^|\/)(example|test|temp|tmp|demo|sample)\.(txt|md|json|js|ts)$/i
-      if ((name === 'write' || name === 'write_file') && FORBIDDEN_FILE_RE.test(toolPath)) {
-        const block = `错误：【禁止文件拦截】${toolPath} 属于测试性文件，禁止写入。`
-        noteFailure(replanState, 'preflightBlock', block)
-        convo.push({ role: 'tool', content: block, name } as AiMessage)
-        events?.onToolResult?.(name, block)
+
+      const fileBlock = checkForbiddenFile(name, toolPath)
+      if (fileBlock) {
+        noteFailure(replanState, 'preflightBlock', fileBlock)
+        convo.push({ role: 'tool', content: fileBlock, name } as AiMessage)
+        events?.onToolResult?.(name, fileBlock)
         continue
       }
 
-      // 禁止命令拦截：直接装包 / npm init / 全局安装，必须走 package.json 声明依赖
-      if (name === 'bash' || name === 'run_terminal_command') {
-        const FORBIDDEN_CMD_RE = /\bnpm\s+(install|i)\s+[@a-z][a-z0-9-]*@[\d.]+|\bnpm\s+(init|create)\b|\bnpm\s+(install|i)\s+-g\b/i
-        if (FORBIDDEN_CMD_RE.test(toolCmd)) {
-          const block = `错误：【禁止命令拦截】${toolCmd} 属于禁止命令。`
-          noteFailure(replanState, 'preflightBlock', block)
-          convo.push({ role: 'tool', content: block, name } as AiMessage)
-          events?.onToolResult?.(name, block)
-          continue
-        }
+      const cmdBlock = checkForbiddenCommand(toolCmd)
+      if (cmdBlock) {
+        noteFailure(replanState, 'preflightBlock', cmdBlock)
+        convo.push({ role: 'tool', content: cmdBlock, name } as AiMessage)
+        events?.onToolResult?.(name, cmdBlock)
+        continue
       }
 
-      // 同命令防抖：start_background_task / run_terminal_command 在 60s 窗口内
-      // 执行达到 2 次后第 3 次直接拦截（典型：npm run dev 连续秒退仍被反复调用）
       if (name === 'start_background_task' || name === 'run_terminal_command') {
-        if (toolCmd) {
-          const now = Date.now()
-          const history = (commandHistory.get(toolCmd) ?? []).filter((t) => now - t < 60_000)
-          if (history.length >= 2) {
-            const block = `错误：【防抖拦截】${toolCmd} 在 60 秒内已执行 ${history.length} 次且均秒退，判定为死循环。请先用 read_file / list_directory 定位问题。`
-            noteFailure(replanState, 'preflightBlock', block)
-            convo.push({ role: 'tool', content: block, name } as AiMessage)
-            events?.onToolResult?.(name, block)
-            batchInterrupted = true
-            break
-          }
-          history.push(now)
-          commandHistory.set(toolCmd, history)
+        const throttleBlock = checkCommandThrottle(toolCmd, commandHistory)
+        if (throttleBlock) {
+          noteFailure(replanState, 'preflightBlock', throttleBlock)
+          convo.push({ role: 'tool', content: throttleBlock, name } as AiMessage)
+          events?.onToolResult?.(name, throttleBlock)
+          batchInterrupted = true
+          break
         }
       }
+      // ===== 工具守卫结束 =====
 
       // targetDir 工作区限定：plan 指定子目录后，文件变更禁止落在父目录（根目录与子目录混写污染源）。
       // 读操作不限（排查需要）；create_directory 创建目标目录本身豁免。
