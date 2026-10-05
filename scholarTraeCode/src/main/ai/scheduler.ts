@@ -29,7 +29,15 @@ import {
   currentChoice,
   type ModelRole
 } from './modelRegistry'
-import { parseTaskDag, createDagState, readyNodes, checkOrderViolation, type TaskDag } from './taskDag'
+import {
+  parseTaskDag,
+  createDagState,
+  readyNodes,
+  checkOrderViolation,
+  markDone,
+  markFailed,
+  type TaskDag
+} from './taskDag'
 import { resolveVfsPath, roleEnvironmentHint, isThreeModelMode } from './virtualFs'
 import {
   createObserverState,
