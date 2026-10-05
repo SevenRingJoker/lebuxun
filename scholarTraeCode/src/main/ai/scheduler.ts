@@ -72,7 +72,7 @@ import {
 } from '../../shared/projectProfiles'
 import { getTemplate } from './validationTemplates'
 import { FAST_FAIL_BREAKER_TAG } from '../terminal/commandError'
-import { validateDagStatic, findForbiddenFile, findForbiddenCommand } from './dagValidator'
+import { validateDagStatic } from './dagValidator'
 import { gateBashCommand, gateBashMessage, type BashGateContext } from './bashGate'
 import { runInteractiveInPty } from '../handlers/ptyManager'
 import {
@@ -1208,8 +1208,6 @@ async function runWithTools(
     cachedModels.filter((m) => m.available).map((m) => m.id)
   )
   if (threeModelMode) {
-    // 项目创建请求：启动前清理历史失败运行残留的测试性垃圾文件
-    if (params.workspace && isProjectCreation(strippedMessages)) cleanupLeftoverJunk(params.workspace)
     // 三模型模式：先切到 Planner 生成 DAG，再切回 Executor 执行
     const userText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
     const profile = detectProfileFromText(userText)
@@ -1536,8 +1534,6 @@ async function runWithTools(
   let fileActionWindow: string[] = []
   // 同命令防抖：60 秒窗口内同命令执行 2 次后，第 3 次直接拦截（防止 npm run dev 秒退死循环）
   const commandHistory = new Map<string, number[]>()
-  const CMD_THROTTLE_WINDOW_MS = 60_000
-  const CMD_THROTTLE_THRESHOLD = 2
 
   // Agent 执行轨迹录制：traceDir 传入时记录每轮模型/工具调用与耗时，结束后落盘
   const log = getLogger('scheduler')
@@ -1938,57 +1934,47 @@ async function runWithTools(
         }
       }
 
-      // 禁止文件拦截（与 DAG 静态审查同源）：example/test/temp 等测试性文件禁止写入，
-      // 防止模型自由发挥污染标准项目结构
-      if (name === 'write' || name === 'write_file') {
-        const toolPath = String(args?.path ?? '').replace(/\\/g, '/')
-        const forbidden = findForbiddenFile(toolPath)
-        if (forbidden) {
-          const block = `错误：${forbidden}`
+      // 禁止文件拦截：example/test/temp 等测试性文件禁止写入
+      const toolPath = String(args?.path ?? '').replace(/\\/g, '/').toLowerCase()
+      const toolCmd = String(args?.command ?? '')
+      const FORBIDDEN_FILE_RE = /(^|\/)(example|test|temp|tmp|demo|sample)\.(txt|md|json|js|ts)$/i
+      if ((name === 'write' || name === 'write_file') && FORBIDDEN_FILE_RE.test(toolPath)) {
+        const block = `错误：【禁止文件拦截】${toolPath} 属于测试性文件，禁止写入。`
+        noteFailure(replanState, 'preflightBlock', block)
+        convo.push({ role: 'tool', content: block, name } as AiMessage)
+        events?.onToolResult?.(name, block)
+        continue
+      }
+
+      // 禁止命令拦截：直接装包 / npm init / 全局安装，必须走 package.json 声明依赖
+      if (name === 'bash' || name === 'run_terminal_command') {
+        const FORBIDDEN_CMD_RE = /\bnpm\s+(install|i)\s+[@a-z][a-z0-9-]*@[\d.]+|\bnpm\s+(init|create)\b|\bnpm\s+(install|i)\s+-g\b/i
+        if (FORBIDDEN_CMD_RE.test(toolCmd)) {
+          const block = `错误：【禁止命令拦截】${toolCmd} 属于禁止命令。`
           noteFailure(replanState, 'preflightBlock', block)
-          events?.onToolCall?.(name, args)
           convo.push({ role: 'tool', content: block, name } as AiMessage)
           events?.onToolResult?.(name, block)
           continue
         }
       }
 
-      // 禁止命令拦截：直接装包（npm i pkg@ver）/ npm init / 全局安装，必须走 package.json 声明依赖
-      if (name === 'bash' || name === 'run_terminal_command' || name === 'start_background_task') {
-        const forbidden = findForbiddenCommand(cmd)
-        if (forbidden) {
-          const block = `错误：${forbidden}`
-          noteFailure(replanState, 'preflightBlock', block)
-          events?.onToolCall?.(name, args)
-          convo.push({ role: 'tool', content: block, name } as AiMessage)
-          events?.onToolResult?.(name, block)
-          continue
+      // 同命令防抖：start_background_task / run_terminal_command 在 60s 窗口内
+      // 执行达到 2 次后第 3 次直接拦截（典型：npm run dev 连续秒退仍被反复调用）
+      if (name === 'start_background_task' || name === 'run_terminal_command') {
+        if (toolCmd) {
+          const now = Date.now()
+          const history = (commandHistory.get(toolCmd) ?? []).filter((t) => now - t < 60_000)
+          if (history.length >= 2) {
+            const block = `错误：【防抖拦截】${toolCmd} 在 60 秒内已执行 ${history.length} 次且均秒退，判定为死循环。请先用 read_file / list_directory 定位问题。`
+            noteFailure(replanState, 'preflightBlock', block)
+            convo.push({ role: 'tool', content: block, name } as AiMessage)
+            events?.onToolResult?.(name, block)
+            batchInterrupted = true
+            break
+          }
+          history.push(now)
+          commandHistory.set(toolCmd, history)
         }
-      }
-
-      // 同命令防抖：start_background_task / run_terminal_command / bash 在 60s 窗口内
-      // 执行达到阈值后直接拦截（典型：npm run dev 连续秒退仍被反复调用）
-      if (
-        (name === 'start_background_task' || name === 'run_terminal_command' || name === 'bash') &&
-        cmd
-      ) {
-        const nowTs = Date.now()
-        const recent = (commandHistory.get(cmd) ?? []).filter(
-          (t) => nowTs - t < CMD_THROTTLE_WINDOW_MS
-        )
-        if (recent.length >= CMD_THROTTLE_THRESHOLD) {
-          const block =
-            `错误：【防抖拦截】命令 "${cmd}" 在 60 秒内已被执行 ${recent.length} 次且均秒退，判定为死循环，禁止重复执行。` +
-            '请立即 read_file 或 list_directory 定位缺失的依赖/配置，修复后再尝试。'
-          noteFailure(replanState, 'preflightBlock', block)
-          events?.onToolCall?.(name, args)
-          convo.push({ role: 'tool', content: block, name } as AiMessage)
-          events?.onToolResult?.(name, block)
-          batchInterrupted = true
-          break
-        }
-        recent.push(nowTs)
-        commandHistory.set(cmd, recent)
       }
 
       // targetDir 工作区限定：plan 指定子目录后，文件变更禁止落在父目录（根目录与子目录混写污染源）。
@@ -3165,37 +3151,26 @@ let currentTaskManifest: ArtifactManifest | null = null
 let currentTaskCtx: PromptContext | null = null
 
 /**
- * 把 createdFiles 归一化为「相对 targetDir（其次相对 workspace）」的路径集合，
- * 供验证锁 fileExists 规则精确/后缀匹配。覆盖三种历史存储形态：
- *  1. 绝对路径 D:\ws\vue2-project\package.json → package.json
- *  2. 带子目录前缀 vue2-project/src/main.js      → src/main.js
- *  3. 已是相对路径 package.json / src/main.js     → 原样保留
- * 纯字符串处理（零 IO），大小写不敏感地剥离前缀。
+ * 路径归一化：剥掉绝对路径前缀，只保留项目内的相对路径（与 validateTaskCompletion 同源）。
+ * 覆盖三种形态：绝对路径、带 targetDir 前缀路径、已是相对路径。
  */
 function normalizeCreatedFilesForValidation(
   files: Set<string>,
-  workspace?: string | null,
   targetDir?: string | null
 ): Set<string> {
-  const toFwd = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '')
-  const ws = workspace ? toFwd(workspace) : ''
-  const td = targetDir ? toFwd(targetDir) : ''
-  const stripPrefix = (p: string, prefix: string): string => {
-    if (!prefix) return p
-    return p.toLowerCase().startsWith(prefix.toLowerCase() + '/')
-      ? p.slice(prefix.length + 1)
-      : p
+  const normalizePath = (p: string): string => {
+    let n = p.replace(/\\/g, '/')
+    if (targetDir) {
+      const td = targetDir.replace(/\\/g, '/')
+      const idx = n.toLowerCase().indexOf('/' + td.toLowerCase() + '/')
+      if (idx >= 0) n = n.slice(idx + td.length + 2)
+    }
+    // 兜底：从最后一个常见的项目目录标记开始截取
+    const m = n.match(/\/(package\.json|src\/|public\/|babel\.config\.js|vue\.config\.js|index\.html|README\.md)/i)
+    if (m && m.index !== undefined) n = n.slice(m.index + 1)
+    return n
   }
-  const out = new Set<string>()
-  for (const raw of files) {
-    let p = toFwd(raw)
-    // 绝对路径先剥离工作区根（d:/ws/vue2-project/x.js → vue2-project/x.js）
-    if (ws) p = stripPrefix(p, ws)
-    // 再剥离 targetDir 前缀（vue2-project/package.json → package.json）
-    if (td) p = stripPrefix(p, td)
-    out.add(p)
-  }
-  return out
+  return new Set(Array.from(files).map(normalizePath))
 }
 
 /**
@@ -3214,7 +3189,7 @@ export function getValidationState(): {
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
   // 路径归一化：与 validateTaskCompletion 同源，前端面板与验证层看到的路径一致
-  const createdFiles = normalizeCreatedFilesForValidation(ctx.createdFiles, ctx.workspace, ctx.targetDir)
+  const createdFiles = normalizeCreatedFilesForValidation(ctx.createdFiles, ctx.targetDir)
   return {
     manifest: currentTaskManifest,
     ctx: {
@@ -3231,28 +3206,34 @@ export function setValidationManifest(m: ArtifactManifest | null): void {
 }
 
 export function validateTaskCompletion(ctx: PromptContext): string | null {
-  // manifest 选择优先级：1) ctx.artifactManifest（generatePlan 注入 / 前端 setCurrent 写入）
-  let manifest: ArtifactManifest | null = ctx.artifactManifest ?? null
-  if (!manifest) {
-    // 2) 缺省 + 项目创建 → vueScaffoldManifest 预置 5 项
-    if (ctx.isProjectCreation) {
-      manifest = vueScaffoldManifest
-    } else {
-      // 3) 缺省 + 非项目创建 → 无校验，放行
-      return null
+  const manifest = ctx.artifactManifest ?? (ctx.isProjectCreation ? vueScaffoldManifest : null)
+  if (!manifest) return null
+
+  // ✅ 路径归一化：剥掉绝对路径前缀，只保留项目内的相对路径
+  // 覆盖三种形态：绝对路径、带 targetDir 前缀路径、已是相对路径
+  const targetDir = ctx.targetDir
+  const normalizePath = (p: string): string => {
+    let n = p.replace(/\\/g, '/')
+    if (targetDir) {
+      const td = targetDir.replace(/\\/g, '/')
+      const idx = n.toLowerCase().indexOf('/' + td.toLowerCase() + '/')
+      if (idx >= 0) n = n.slice(idx + td.length + 2)
     }
+    // 兜底：从最后一个常见的项目目录标记开始截取
+    const m = n.match(/\/(package\.json|src\/|public\/|babel\.config\.js|vue\.config\.js|index\.html|README\.md)/i)
+    if (m && m.index !== undefined) n = n.slice(m.index + 1)
+    return n
   }
-  // 适配器：把 scheduler 内部三个布尔标志位反向翻译为 executedCommands Map，
-  // 让 commandExecuted 验证器能命中（与现状追踪逻辑对齐）
+
+  const normalizedCreated = new Set(Array.from(ctx.createdFiles).map(normalizePath))
+
   const executedCommands = new Map<string, string>()
   if (ctx.ranNpmInstall) executedCommands.set('npm install', '')
   if (ctx.ranServe) executedCommands.set('npm run serve', '')
   if (ctx.ranMkdir) executedCommands.set('mkdir', '')
-  // 路径归一化：剥离 workspace/targetDir 前缀，得到 manifest 相对路径（package.json、src/main.js），
-  // 覆盖绝对路径（DAG 模式 VFS 注入）与子目录前缀路径（文本计划模式）两种形态
-  const createdFiles = normalizeCreatedFilesForValidation(ctx.createdFiles, ctx.workspace, ctx.targetDir)
+
   const vctx: ValidationContext = {
-    createdFiles,
+    createdFiles: normalizedCreated,
     executedCommands,
     workspace: ctx.workspace ?? undefined
   }

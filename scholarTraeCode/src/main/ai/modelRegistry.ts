@@ -87,11 +87,34 @@ export async function switchModel(
   await prev
 
   try {
+    // ✅ 关键修复：先卸载旧模型再计算可用显存。
+    // 否则 getFreeVram 读到的是旧模型占用后的剩余显存，选模型时会低估可用空间
+    // （典型表现：8B 驻留时切 14B，按剩余显存判定为放不下，实际卸载后完全够）。
+    // 为避免「同模型跨角色」时无意义的卸载-加载循环，先用当前显存快速预测目标模型；
+    // 命中同模型同上下文则直接复用，否则先卸载再做正式的显存探测与选型。
+    if (current) {
+      const probeFree = await getFreeVram({ signal: opts?.signal })
+      const probe = await selectModelForRoleWithDiagnostics(role, probeFree, { signal: opts?.signal })
+      if (
+        !opts?.force &&
+        probe.choice &&
+        current.profile.name === probe.choice.profile.name &&
+        current.numCtx === probe.choice.numCtx
+      ) {
+        // 同模型同上下文复用：不卸载、不 warmup，仅更新角色
+        currentRole_ = role
+        opts?.onSwitch?.(currentRole_, role, false)
+        return { ok: true, choice: current, degraded: false }
+      }
+      console.log(`[TraeCode] 切换前先卸载 ${current.profile.name}，释放显存`)
+      await unloadCurrentModel({ signal: opts?.signal })
+    }
+
+    // 旧模型已卸载，getFreeVram 才是真实可用值
     const freeVram = await getFreeVram({ signal: opts?.signal })
     const diag = await selectModelForRoleWithDiagnostics(role, freeVram, { signal: opts?.signal })
-    // 详细诊断日志：UI 排错时能立刻看出为什么选了这个模型 / 为什么没选
     console.log(
-      `[TraeCode] 角色=${role} 可用显存=${freeVram.toFixed(1)}GB ` +
+      `[TraeCode] 角色=${role} 卸载后可用显存=${freeVram.toFixed(1)}GB ` +
       `候选=${diag.totalAvailable}个 [${diag.availableNames.join(', ') || '(空)'}] ` +
       `→ ${diag.choice?.profile.name ?? '(无)'} ctx=${diag.choice?.numCtx ?? '-'}`
     )
@@ -100,20 +123,15 @@ export async function switchModel(
       return {
         ok: false,
         error:
-          `角色 ${role} 无可用模型（可用显存 ${freeVram.toFixed(1)}GB）。` +
+          `角色 ${role} 无可用模型（卸载后可用显存 ${freeVram.toFixed(1)}GB）。` +
           `可用: ${diag.availableNames.join(', ') || '(空)'}。` +
           `拒绝原因: ${diag.rejectionLog.join('; ') || '无'}`
       }
     }
     const choice = diag.choice
 
-    // 已在驻留且同模型同上下文：复用
-    if (!opts?.force && current && current.profile.name === choice.profile.name && current.numCtx === choice.numCtx) {
-      currentRole_ = role
-      return { ok: true, choice: current, degraded: false }
-    }
-
-    await doSwitch(choice, role, opts)
+    // doSwitch 里不再卸载（已在前面卸载）
+    await doSwitch(choice, role, { ...opts, skipUnload: true })
     currentRole_ = role
     opts?.onSwitch?.(currentRole_, role, false)
     return { ok: true, choice, degraded: false }
@@ -124,14 +142,15 @@ export async function switchModel(
 
 /** 内部切换流程：unload → warmup → 置 current（调用方已持有互斥锁）。
  * 不再主动同步 provider —— provider 每次请求时通过 getActiveModel() 拉取，
- * 状态单源化，杜绝双写不一致。 */
+ * 状态单源化，杜绝双写不一致。
+ * skipUnload=true 时跳过卸载步骤（switchModel 在调用前已卸载旧模型）。 */
 async function doSwitch(
   target: ModelChoice,
   role: ModelRole,
-  opts?: { signal?: AbortSignal }
+  opts?: { signal?: AbortSignal; skipUnload?: boolean }
 ): Promise<void> {
-  // 1. 卸载当前（若有）
-  if (current) {
+  // 1. 卸载当前（若有且调用方未提前卸载）
+  if (!opts?.skipUnload && current) {
     await unloadCurrentModel({ signal: opts?.signal })
   }
   // 2. warmup 目标模型（权重真正入 GPU）
