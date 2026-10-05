@@ -33,7 +33,6 @@ import {
   parseTaskDag,
   createDagState,
   readyNodes,
-  checkOrderViolation,
   markDone,
   markFailed,
   type TaskDag
@@ -606,7 +605,19 @@ async function generateDagPlan(
 
 要求：
 - 文件创建节点（write_file）complexity 按代码量标记：>200 行或复杂组件 → "high"（路由 Coder），否则 "low"（Executor 直接执行）
-- 依赖关系必须准确：npm install 依赖 package.json 创建节点；npm run serve 依赖 npm install 节点
+- DAG 依赖设计原则（重要，必须遵守）：
+  1. 所有 write_file 节点相互独立，dependencies 全部为 []（文件创建可并行）
+  2. npm install 依赖所有 write_file 节点：dependencies=[所有 write 节点 id]
+  3. npm run serve / npm run dev 依赖 npm install 节点：dependencies=[npm_install_id]
+  4. 绝对不要把 write_file 设计成链式依赖（n1→n2→n3 是错误的）
+- 正确示例：
+  {"nodes":[
+    {"id":"w1","action":"write_file","args":{"path":"package.json","content":"..."},"dependencies":[]},
+    {"id":"w2","action":"write_file","args":{"path":"src/main.js","content":"..."},"dependencies":[]},
+    {"id":"w3","action":"write_file","args":{"path":"src/App.vue","content":"..."},"dependencies":[]},
+    {"id":"i1","action":"run_command","args":{"command":"npm install","cwd":"vue2-project"},"dependencies":["w1","w2","w3"]},
+    {"id":"r1","action":"run_command","args":{"command":"npm run serve","cwd":"vue2-project"},"dependencies":["i1"]}
+  ]}
 - 禁止全局安装命令（npm install -g 等）；禁止 npm init；必须用 write_file 直接写 package.json
 - Vue2 项目必须用 Vue 2 API（new Vue()），禁止 createApp`
 
@@ -811,6 +822,21 @@ export const READ_LIKE_TOOLS = new Set(['read', 'read_file', 'read_text_file', '
 /** 读取结果中「目标不存在」的判定（仅在结果以错误前缀开头时参与判定，避免误伤正文） */
 const READ_NOT_FOUND_RE = /不存在|enoent|no such file|not found|找不到|无法找到/i
 
+/**
+ * DAG action → 允许的工具名映射表。
+ * DAG 节点的 action 是抽象动作（write_file/run_command），
+ * 而模型实际调用的工具名可能不同（write/write_file、run_terminal_command/bash）。
+ * 此表是越序/参数校验的唯一映射源。
+ */
+const DAG_ACTION_TO_TOOLS: Record<string, string[]> = {
+  'write_file': ['write', 'write_file'],
+  'edit_file': ['edit', 'edit_file', 'str_replace'],
+  'delete_file': ['delete', 'delete_file'],
+  'create_directory': ['create_directory'],
+  'run_command': ['run_terminal_command', 'start_background_task', 'bash'],
+  'read_file': ['read', 'read_file', 'read_text_file']
+}
+
 /** 提取读取类工具的目标路径（归一化小写正斜杠）；无路径参数返回 null */
 function readTargetOf(args: unknown): string | null {
   const a = (args ?? {}) as Record<string, unknown>
@@ -879,7 +905,13 @@ export async function scheduleChatWithTools(
     hint: params.taskType
   })
   const taskType: TaskType = classified.task === 'chat' ? 'tool' : classified.task
-  const { strippedMessages } = classified
+  // ✅ 过滤历史 smoke 测试残留消息（.smoke-staging / smoke-extra 等），
+  // 避免持久化的测试上下文污染当前任务的模型输入
+  const strippedMessages = classified.strippedMessages.filter((m) => {
+    if (m.role !== 'user') return true
+    const text = m.content.toLowerCase()
+    return !text.includes('.smoke-staging') && !text.includes('smoke-extra')
+  })
   const role = taskTypeToModelRole(taskType)
 
   const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT
@@ -3270,6 +3302,11 @@ async function runWithDag(
 ): Promise<string> {
   if (!dag) return '错误：DAG 为空'
 
+  // ✅ targetDir 兜底：参数 targetDir 可能为 null（DAG 解析时未提取），
+  // 优先用 dag.targetDir，确保文件写入正确的子目录而非工作区根
+  const effectiveTargetDir = targetDir ?? dag?.targetDir ?? null
+  console.log(`[DEBUG][runWithDag] targetDir=${targetDir} dag.targetDir=${dag?.targetDir} effective=${effectiveTargetDir}`)
+
   // 创建 DAG 运行态
   const dagState = createDagState(dag)
   const skills = await listSkills(workspace)
@@ -3333,11 +3370,22 @@ async function runWithDag(
   // 观察者状态：读取黑名单连击计数 + 干预防抖
   const observerState = createObserverState()
 
+  // ✅ userRequest 取原始用户文本，过滤掉 DAG JSON / 就绪节点等系统消息
+  // （ctx.plan 若存 DAG JSON 会导致快照 userRequest 字段被污染）
+  const userRequestText = [...messages]
+    .reverse()
+    .find((m) =>
+      m.role === 'user' &&
+      !m.content.trim().startsWith('{') &&
+      !m.content.includes('就绪节点') &&
+      !m.content.includes('【')
+    )?.content ?? '继续任务'
+
   // Agent 上下文
   const ctx: PromptContext = {
     workspace,
     currentFile,
-    plan: JSON.stringify(dag), // DAG JSON 作为 plan
+    plan: userRequestText, // 存原始用户请求，而非 DAG JSON（避免快照 userRequest 污染）
     isProjectCreation: true,
     createdFiles: new Set<string>(),
     ranNpmInstall: false,
@@ -3354,7 +3402,7 @@ async function runWithDag(
     tools: allTools.map((t) => ({ name: t.tool.name, description: t.tool.description })),
     artifactManifest: currentTaskManifest,
     environmentReport,
-    targetDir: targetDir ?? null,
+    targetDir: effectiveTargetDir,
     dagState: dagState,
     observerState: serializeObserverState(observerState)
   }
@@ -3366,6 +3414,7 @@ async function runWithDag(
   const failedReadPaths = new Set<string>()
   const replanState = createReplanState()
   let batchInterrupted = false
+  let noToolCallStreak = 0 // 连续无工具调用轮数，≥2 时强制注入指令
   let blockedDrift: DriftReport | null = null
   let lastContent = ''
   // L4 运行时验证输入：最近一次 serve/dev/start 启动命令与输出（ranServe 置位时同步记录）
@@ -3377,7 +3426,7 @@ async function runWithDag(
   const taskId = `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   const startedAt = Date.now()
   const log = getLogger('scheduler')
-  log.info(`DAG 任务启动 taskId=${taskId} targetDir=${targetDir ?? '(root)'}`)
+  log.info(`DAG 任务启动 taskId=${taskId} targetDir=${effectiveTargetDir ?? '(root)'}`)
 
   events?.onTaskControl?.({ taskId, phase: 'started', preTaskCheckpoint: taskControl?.preTaskCheckpoint ?? null })
 
@@ -3467,9 +3516,18 @@ async function runWithDag(
       ctx.round = round
       ctx.stallRestarts = 0
       ctx.currentTodo = ready.map((n) => `#${n.id} ${n.action}`).join('；')
-      ctx.roleHint = roleEnvironmentHint('executor', targetDir ?? null)
+      ctx.roleHint = roleEnvironmentHint('executor', effectiveTargetDir ?? null)
 
-      const agentSystem: AiMessage = { role: 'system', content: buildAgentPrompt(ctx) }
+      const agentSystem: AiMessage = {
+        role: 'system',
+        content:
+          buildAgentPrompt(ctx) +
+          '\n\n【DAG 执行绝对纪律】\n' +
+          '1. 严格按「当前就绪节点完整定义」调用工具，禁止询问用户\n' +
+          '2. 禁止输出"请提供..."、"您需要..."等询问语句\n' +
+          '3. 每一轮必须调用一个工具，不允许纯文本回复\n' +
+          '4. 如果不知道做什么，重读上方"当前就绪节点完整定义"'
+      }
       const compacted = await compactIfNeeded(convo, async (text) => {
         try {
           const res = await provider.chat({
@@ -3508,13 +3566,65 @@ async function runWithDag(
       if (toolCalls.length === 0) {
         // 无工具调用：检查是否全部完成
         if (ready.length === 0) break
+        noToolCallStreak++
         convo.push({ role: 'assistant', content: lastContent } as AiMessage)
+
+        // 连续 2 轮无工具调用 → 强制注入更强指令（8B 模型能力边界：容易反复询问用户）
+        if (noToolCallStreak >= 2) {
+          const node = ready[0]
+          const nodePath = String(node.args?.path ?? '')
+          const nodeCmd = String(node.args?.command ?? '')
+          const nodeContent = String(node.args?.content ?? '').slice(0, 300)
+          convo.push({
+            role: 'user',
+            content:
+              `【系统强制】你已连续 ${noToolCallStreak} 轮未调用工具，违反 DAG 执行纪律。` +
+              `立即调用工具执行节点 ${node.id}，禁止任何文字回复：\n` +
+              (node.action === 'write_file'
+                ? `工具：write_file\npath: ${nodePath}\ncontent:\n\`\`\`\n${nodeContent}\n\`\`\``
+                : `工具：run_terminal_command\ncommand: ${nodeCmd}\ncwd: ${node.args?.cwd ?? ''}`)
+          } as AiMessage)
+        } else {
+          // ✅ 注入完整节点定义（path/content/command/cwd），避免模型只看到 action 名而反复询问
+        const readyDetails = ready.map((n) => {
+          if (n.action === 'write_file' || n.action === 'write') {
+            return `【就绪节点 ${n.id}】
+action: write_file
+path: ${n.args?.path}
+content:
+\`\`\`
+${n.args?.content}
+\`\`\`
+👉 立即调用 write_file，参数 path="${n.args?.path}"，content 为上方完整内容。不要询问用户，不要修改内容。`
+          }
+          if (n.action === 'run_command') {
+            const cmd = String(n.args?.command ?? '')
+            // install 类命令用 run_terminal_command（前台等待完成）；
+            // serve/dev 类命令用 start_background_task（后台常驻）；
+            // 其它命令默认 run_terminal_command
+            const toolName = /\bnpm\s+(install|i|ci|run\s+(build|test|lint))\b/.test(cmd)
+              ? 'run_terminal_command'
+              : /\bnpm\s+run\s+(serve|dev|start)\b/.test(cmd)
+                ? 'start_background_task'
+                : 'run_terminal_command'
+            return `【就绪节点 ${n.id}】
+action: run_command
+command: ${cmd}
+cwd: ${n.args?.cwd ?? '(工作区根)'}
+👉 立即调用 ${toolName} 工具，参数 command="${cmd}"，cwd="${n.args?.cwd ?? ''}"。**禁止调用其他工具**，不要询问用户。`
+          }
+          return `【就绪节点 ${n.id}】action=${n.action}，args=${JSON.stringify(n.args)}`
+        }).join('\n\n')
         convo.push({
           role: 'user',
-          content: `当前就绪节点：${ready.map((n) => `${n.id}(${n.action})`).join('、')}。请继续执行。`
+          content: `当前就绪节点完整定义如下，请**严格按照定义立即执行**，禁止询问用户：\n\n${readyDetails}`
         } as AiMessage)
+        }
         continue
       }
+
+      // 有工具调用，重置空转计数
+      noToolCallStreak = 0
 
       convo.push({ role: 'assistant', content: lastContent } as AiMessage)
 
@@ -3545,7 +3655,7 @@ async function runWithDag(
 
         // 路径劫持
         if (args?.path && typeof args.path === 'string') {
-          const vfs = resolveVfsPath(args.path, workspace ?? '', targetDir)
+          const vfs = resolveVfsPath(args.path, workspace ?? '', effectiveTargetDir)
           if (!vfs.ok) {
             const block = `错误：【路径劫持】${vfs.error}`
             convo.push({ role: 'tool', content: block, name } as AiMessage)
@@ -3553,16 +3663,6 @@ async function runWithDag(
             continue
           }
           args.path = vfs.absPath
-        }
-
-        // 越序拦截
-        const violation = checkOrderViolation(dagState, name ?? '', args)
-        if (violation) {
-          noteFailure(replanState, 'preflightBlock', violation)
-          events?.onToolCall?.(name, args)
-          convo.push({ role: 'tool', content: violation, name } as AiMessage)
-          events?.onToolResult?.(name, violation)
-          continue
         }
 
         // 读取黑名单
@@ -3629,13 +3729,16 @@ async function runWithDag(
         }
 
         // 复杂度路由：write/edit 节点标记 complexity=high 时切换到 Coder 生成内容
-        const matchedReadyNode = ready.find((n) => n.action === name)
+        const matchedReadyNode = ready.find((n) => {
+          const allowedTools = DAG_ACTION_TO_TOOLS[n.action] ?? [n.action]
+          return allowedTools.includes(name)
+        })
         if (
           matchedReadyNode &&
           matchedReadyNode.complexity === 'high' &&
           (name === 'write' || name === 'write_file' || name === 'edit')
         ) {
-          const coderResult = await runCoderForNode(matchedReadyNode, args, ctx, targetDir ?? null, provider, signal)
+          const coderResult = await runCoderForNode(matchedReadyNode, args, ctx, effectiveTargetDir ?? null, provider, signal)
           if (coderResult) {
             // Coder 产出内容：write 覆盖 args.content，edit 覆盖 args.new_string
             args = { ...args, ...coderResult }
@@ -3652,14 +3755,43 @@ async function runWithDag(
           ? await callMcpTool(found.server, name, args, workspace, signal)
           : `错误：未找到工具 ${name}`
 
-        // 标记 DAG 节点状态
-        const matchedNode = ready.find((n) => n.action === name)
-        if (matchedNode) {
-          if (result.startsWith('错误') || result.startsWith('Error')) {
-            markFailed(dagState, matchedNode.id, result)
-          } else {
-            markDone(dagState, matchedNode.id, result)
+        // 标记 DAG 节点状态：用 action→工具名映射表匹配，再校验参数（path/command），
+        // 防止 AI 调 write_file('example.txt') 却匹配到 package.json 节点被误标记完成。
+        // ✅ 每次工具执行前基于当前 ready 快照匹配；标记完成/失败后立即从快照移除，
+        // 防止同批次第二个工具（如同命令的 run_terminal_command + start_background_task）
+        // 复用旧快照重复匹配同一节点。
+        const matchedNode = ready.find((n) => {
+          const allowedTools = DAG_ACTION_TO_TOOLS[n.action] ?? [n.action]
+          if (!allowedTools.includes(name)) return false
+
+          if (n.action === 'write_file') {
+            const nodePath = String(n.args?.path ?? '').replace(/\\/g, '/').toLowerCase()
+            const toolPath = String(args?.path ?? '').replace(/\\/g, '/').toLowerCase()
+            return toolPath === nodePath || toolPath.endsWith('/' + nodePath)
           }
+          if (n.action === 'run_command') {
+            return String(n.args?.command ?? '').trim() === String(args?.command ?? '').trim()
+          }
+          return true
+        })
+        if (!matchedNode) {
+          const readyList = ready
+            .map((n) => `${n.id}(${n.action}: ${n.args?.path ?? n.args?.command ?? '?'})`)
+            .join('、')
+          const block =
+            `错误：【越序拦截】工具 ${name} 不在当前就绪节点中。` +
+            `当前就绪节点：${readyList}。` +
+            `请按 DAG 顺序执行。`
+          convo.push({ role: 'tool', content: block, name } as AiMessage)
+          events?.onToolResult?.(name, block)
+          continue
+        }
+        // 从本批次 ready 快照中先移除（无论成败），确保同批次后续工具不再命中此节点
+        ready.splice(ready.indexOf(matchedNode), 1)
+        if (result.startsWith('错误') || result.startsWith('Error')) {
+          markFailed(dagState, matchedNode.id, result)
+        } else {
+          markDone(dagState, matchedNode.id, result)
         }
 
         convo.push({ role: 'tool', content: result, name } as AiMessage)
@@ -3670,8 +3802,21 @@ async function runWithDag(
           ctx.createdFiles.add(String(args.path))
         }
         if (name === 'start_background_task' || name === 'bash' || name === 'run_terminal_command') {
-          if (/\bnpm\s+(install|i|ci)\b/.test(cmd)) ctx.ranNpmInstall = true
-          if (/\bnpm\s+run\s+(serve|dev|start)\b/.test(cmd)) {
+          // ✅ 只有命令成功才置位（与 runWithTools 口径一致）
+          // 统一失败判定：非零退出 / 秒退熔断 / 常见错误关键字
+          const exitLine = result.match(/^退出码\s+(\d+)/m)
+          const nonZeroExit = exitLine ? Number(exitLine[1]) !== 0 : false
+          const strongFail =
+            nonZeroExit ||
+            result.includes(FAST_FAIL_BREAKER_TAG) ||
+            /npm ERR!|npm error|ELIFECYCLE|不是内部或外部命令|command not found|exited with code [1-9]|exit code [1-9]|build failed|compilation failed|系统找不到指定的路径|no such file or directory/i.test(
+              result
+            )
+
+          if (/\bnpm\s+(install|i|ci)\b/.test(cmd) && !strongFail) {
+            ctx.ranNpmInstall = true
+          }
+          if (/\bnpm\s+run\s+(serve|dev|start)\b/.test(cmd) && !strongFail) {
             ctx.ranServe = true
             // 记录最近一次启动命令与输出，供 L4 运行时验证推断端口/打包诊断
             lastServeCmd = cmd
@@ -3712,7 +3857,7 @@ async function runWithDag(
     }
 
     // L3 语义验证：依赖闭环检查（失败时 Coder 生成修复补丁走 staging）
-    const l3Result = await runSemanticValidation(ctx, workspace ?? '', targetDir ?? null, provider, signal)
+    const l3Result = await runSemanticValidation(ctx, workspace ?? '', effectiveTargetDir ?? null, provider, signal)
     if (l3Result) {
       noteFailure(replanState, 'validationBlock', l3Result)
       const drift: DriftReport = {
@@ -3730,7 +3875,7 @@ async function runWithDag(
         lastServeOutput,
         ctx,
         workspace ?? '',
-        targetDir ?? null,
+        effectiveTargetDir ?? null,
         provider,
         signal
       )

@@ -19,14 +19,23 @@ export function resolveVfsPath(
   if (!workspace) return { ok: false, error: 'workspace 未指定' }
 
   const ws = normalize(workspace)
+  const tdAbs = targetDir ? normalize(resolve(ws, targetDir)) : null
+
   let abs: string
   if (isAbsolute(trimmed)) {
     abs = normalize(trimmed)
+    // 必须在工作区内
     if (!abs.startsWith(ws + sep) && abs !== ws) {
       return { ok: false, error: `绝对路径 ${trimmed} 越出工作区 ${ws}` }
     }
+    // ✅ 若指定了 targetDir，把指向工作区根/其它子目录的绝对路径重映射到 targetDir 下
+    // （AI 常把 plan 中的相对路径误传为绝对路径，如 D:\ws\package.json，应写入 D:\ws\targetDir\package.json）
+    if (tdAbs && !abs.startsWith(tdAbs + sep) && abs !== tdAbs) {
+      const rel = abs.slice(ws.length).replace(/^[\\/]+/, '')
+      abs = normalize(resolve(tdAbs, rel))
+    }
   } else {
-    const base = targetDir ? resolve(ws, targetDir) : ws
+    const base = tdAbs ?? ws
     abs = normalize(resolve(base, trimmed))
     if (!abs.startsWith(ws + sep) && abs !== ws) {
       return { ok: false, error: `路径 ${trimmed} 上跳后越出工作区` }
