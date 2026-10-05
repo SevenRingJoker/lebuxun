@@ -1,14 +1,36 @@
 // 2.2 Provider 真 abort 单测：Ollama fetch 直连 / 非流式 chat signal / 内部 abort 方法
 // 全部 mock fetch，不触网；OllamaProvider 跳过 ensure（healthy 置真）。
+//
+// 阶段一重构后：OllamaProvider 不再持有 currentModelName 等状态字段，
+// 当前驻留模型由 modelRegistry 单源维护。测试通过 _setCurrentForTest 注入 Registry 状态。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isAbortError } from '../types'
 import { OllamaProvider } from './ollamaProvider'
 import { makeOpenAiCompatibleProvider } from './openaiCompatibleProvider'
 import { AnthropicProvider } from './anthropicProvider'
+import { _setCurrentForTest, _resetRegistryForTest } from '../modelRegistry'
+import type { ModelChoice } from '../adaptiveScheduler'
 
 vi.mock('../keyStore', () => ({ getKey: () => 'test-key' }))
 
 const enc = new TextEncoder()
+
+/** 测试专用：构造一个最小的 ModelChoice 注入 Registry（OllamaProvider 通过 getActiveModel 拉取） */
+function makeTestChoice(name: string, numCtx = 8192): ModelChoice {
+  return {
+    profile: {
+      name,
+      family: 'qwen',
+      paramSize: 8,
+      fileSizeGB: 5,
+      isCoder: false,
+      isMoE: false,
+      raw: {}
+    } as ModelChoice['profile'],
+    numCtx,
+    reason: 'test'
+  }
+}
 
 /** 永不 resolve、仅在 signal abort 时 reject 的 fetch（模拟长请求被真中断） */
 function hangingFetch() {
@@ -70,17 +92,19 @@ describe('isAbortError', () => {
 describe('OllamaProvider abort（s28）', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', hangingFetch())
+    _resetRegistryForTest()
   })
   afterEach(() => {
     vi.unstubAllGlobals()
+    _resetRegistryForTest()
   })
 
   function makeProvider(): OllamaProvider {
     const p = new OllamaProvider()
     // 跳过 ensure()（避免启动内嵌 Ollama）；fetch 已 mock，无需健康探测
     ;(p as any).healthy = true
-    // 模拟已通过 switchToRole 选择的激活模型（chat/chatStream 现在强依赖此字段）
-    ;(p as any).currentModelName = 'test-model'
+    // 阶段一重构：OllamaProvider 不再持有模型状态，改为注入 Registry 状态
+    _setCurrentForTest(makeTestChoice('test-model', 8192), 'executor')
     return p
   }
 
@@ -88,7 +112,7 @@ describe('OllamaProvider abort（s28）', () => {
     const p = makeProvider()
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
     const ctrl = new AbortController()
-    const pending = p.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], signal: ctrl.signal })
+    const pending = p.chat({ messages: [{ role: 'user', content: 'hi' }], signal: ctrl.signal })
     // 等 fetch 被调用后再 abort
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
     ctrl.abort()
@@ -103,7 +127,7 @@ describe('OllamaProvider abort（s28）', () => {
   it('provider.abort() → 在途 chat 返回「已中止」', async () => {
     const p = makeProvider()
     const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
-    const pending = p.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+    const pending = p.chat({ messages: [{ role: 'user', content: 'hi' }] })
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
     p.abort()
     const res = await pending
@@ -117,7 +141,7 @@ describe('OllamaProvider abort（s28）', () => {
     const onError = vi.fn()
     const onDone = vi.fn()
     const pending = p.chatStream(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      { messages: [{ role: 'user', content: 'hi' }] },
       { onChunk: () => {}, onDone, onError }
     )
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
@@ -143,7 +167,7 @@ describe('OllamaProvider abort（s28）', () => {
     let usage: any
     let doneInfo: any
     const res = await p.chatStream(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      { messages: [{ role: 'user', content: 'hi' }] },
       {
         onChunk: (d) => chunks.push(d),
         onDone: (i) => (doneInfo = i),
@@ -154,7 +178,8 @@ describe('OllamaProvider abort（s28）', () => {
     expect(res.ok).toBe(true)
     expect(chunks.join('')).toBe('你好')
     expect(usage).toEqual({ tokensIn: 3, tokensOut: 7 })
-    expect(doneInfo.model).toBe('ollama:m')
+    // onDone 的 model 现在来自 Registry 的 active.modelName（test-model），而非 params.model
+    expect(doneInfo.model).toBe('ollama:test-model')
   })
 
   it('chat 正常返回 content/toolCalls/usage', async () => {
@@ -167,11 +192,69 @@ describe('OllamaProvider abort（s28）', () => {
       })
     )
     const p = makeProvider()
-    const res = await p.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+    const res = await p.chat({ messages: [{ role: 'user', content: 'hi' }] })
     expect(res.ok).toBe(true)
     expect(res.content).toBe('ok')
     expect(res.toolCalls).toHaveLength(1)
     expect(res.usage).toEqual({ tokensIn: 5, tokensOut: 9 })
+  })
+
+  // ============== 阶段一新增：无驻留模型错误路径 + 拉模式验证 ==============
+
+  it('未调用 switchModel 时 chat 返回「模型未驻留」错误（拉模式）', async () => {
+    // 重置 Registry，模拟完全无驻留
+    _resetRegistryForTest()
+    const p = new OllamaProvider()
+    ;(p as any).healthy = true
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+
+    const res = await p.chat({ messages: [{ role: 'user', content: 'hi' }] })
+    expect(res.ok).toBe(false)
+    expect(res.error).toContain('模型未驻留')
+    expect(res.error).toContain('switchModel')
+    // 未发起任何 HTTP 请求（提前返回）
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('未调用 switchModel 时 chatStream 返回「模型未驻留」错误并触发 onError', async () => {
+    _resetRegistryForTest()
+    const p = new OllamaProvider()
+    ;(p as any).healthy = true
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const onError = vi.fn()
+    const onDone = vi.fn()
+
+    const res = await p.chatStream(
+      { messages: [{ role: 'user', content: 'hi' }] },
+      { onChunk: () => {}, onDone, onError }
+    )
+    expect(res.ok).toBe(false)
+    expect(res.error).toContain('模型未驻留')
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('模型未驻留'))
+    expect(onDone).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('wire payload 中的 model 字段来自 Registry，不是 \'auto\'', async () => {
+    let capturedBody: any = null
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body ?? '{}'))
+      return {
+        ok: true,
+        status: 200,
+        text: async () => '',
+        json: async () => ({ message: { content: 'ok' } })
+      } as unknown as Response
+    }))
+    _setCurrentForTest(makeTestChoice('real-qwen3-8b', 4096), 'executor')
+    const p = new OllamaProvider()
+    ;(p as any).healthy = true
+
+    await p.chat({ messages: [{ role: 'user', content: 'hi' }] })
+    expect(capturedBody).not.toBeNull()
+    expect(capturedBody.model).toBe('real-qwen3-8b')
+    expect(capturedBody.model).not.toBe('auto')
+    expect(capturedBody.options?.num_ctx).toBe(4096)
   })
 })
 

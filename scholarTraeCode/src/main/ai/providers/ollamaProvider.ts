@@ -1,5 +1,9 @@
 // Ollama 供应商实现：把现有 ollama / electron-ollama 逻辑封装到统一 AiProvider 接口下。
 // 新增供应商（OpenAI/Anthropic 等）只需照此实现 AiProvider，业务层零改动。
+//
+// 执行层定位（三层架构）：本类是纯粹的"手和脚"——只负责 HTTP 请求 / Abort / 流式解析。
+// 不持有任何模型状态字段；当前模型名/上下文由治理层 modelRegistry 单源维护，
+// 每次请求时通过 getActiveModel() 拉取，杜绝双写不一致。
 import { app } from 'electron'
 // 注意：不要用默认导出（import ollama from 'ollama'），
 // 打包为 CJS 后默认导出的互操作会丢失 .list/.chat 方法；改用 Ollama 类显式实例化
@@ -11,7 +15,8 @@ import { isAbortError } from '../types'
 import { resolveCapabilities } from '../modelCapabilities'
 // 2.3 多模态：parts 消息转 Ollama images 协议
 import { toOllamaMessages } from '../messageParts'
-import { selectModelForRole, type ModelRole } from '../adaptiveScheduler'
+// 治理层唯一状态源：当前驻留模型由 modelRegistry 维护
+import { getActiveModel } from '../modelRegistry'
 
 // 模块级共享客户端（仅用于 list/health 探测；chat/chatStream 走原生 fetch 以支持真 abort）
 const client = new Ollama()
@@ -41,14 +46,8 @@ export class OllamaProvider implements AiProvider {
   private healthy = false
   /** 在途请求的 AbortController 集合：abort() 统一触发，请求完成自动移除 */
   private inflight = new Set<AbortController>()
-  /** 当前角色绑定的模型名（由 switchToRole 动态选择） */
-  private currentModelName: string | null = null
-  /** 当前角色建议的上下文长度（由 switchToRole 动态计算） */
-  private currentNumCtx = 8192
-  /** 当前绑定的角色（供 UI 查询） */
-  private currentRole_: 'planner' | 'executor' | 'coder' | 'observer' | null = null
-  /** 切换串行化锁：避免并发切换导致显存叠加 */
-  private switchingLock: Promise<unknown> = Promise.resolve()
+  // 注意：本类不持有任何模型状态字段（currentModelName/currentNumCtx/currentRole_/switchingLock 已删除）。
+  // 当前驻留模型由治理层 modelRegistry 单源维护，chat/chatStream 每次请求时通过 getActiveModel() 拉取。
 
   /** 登记一个在途请求；signal 合并外部信号（调度层停止/超时）与内部 abort() */
   private beginRequest(external?: AbortSignal): { controller: AbortController; signal: AbortSignal } {
@@ -145,7 +144,9 @@ export class OllamaProvider implements AiProvider {
   }
 
   async chat(params: {
-    model: string
+    /** 已废弃：OllamaProvider 忽略此参数，当前模型由 modelRegistry 单源维护。
+     *  保留仅为类型兼容（其它 Provider 仍需显式传入）。Ollama 调用方不应再传。 */
+    model?: string
     messages: AiMessage[]
     tools?: unknown[]
     signal?: AbortSignal
@@ -159,12 +160,12 @@ export class OllamaProvider implements AiProvider {
     const { controller, signal } = this.beginRequest(params.signal)
     try {
       await this.ensure()
-      // 关键修复：强制使用内部绑定的模型（auto 模式必须先经 switchToRole）
-      const activeModel = this.currentModelName
-      if (!activeModel || activeModel === 'auto') {
+      // 拉模式：每次请求时向治理层查询当前驻留模型（单一数据源）
+      const active = getActiveModel()
+      if (!active) {
         return {
           ok: false,
-          error: '[TraeCode] provider 未绑定模型，请先调用 switchToRole（当前是 auto 模式）'
+          error: '[TraeCode] 模型未驻留，请先调用 modelRegistry.switchModel(role)'
         }
       }
       // 2.3 parts 消息转 Ollama 线协议（无 parts 原样透传）
@@ -175,12 +176,12 @@ export class OllamaProvider implements AiProvider {
         headers: { 'Content-Type': 'application/json' },
         signal,
         body: JSON.stringify({
-          model: activeModel,
+          model: active.modelName,
           messages: wireMessages,
           tools: params.tools,
           stream: false,
           keep_alive: KEEP_ALIVE, // 控制 GPU 驻留时长，空闲自动卸载
-          options: { num_ctx: this.currentNumCtx }
+          options: { num_ctx: active.numCtx }
         })
       })
       if (!res.ok) {
@@ -208,16 +209,21 @@ export class OllamaProvider implements AiProvider {
   }
 
   async chatStream(
-    params: { model: string; messages: AiMessage[]; signal?: AbortSignal },
+    params: {
+      /** 已废弃：同 chat，OllamaProvider 忽略此参数 */
+      model?: string
+      messages: AiMessage[]
+      signal?: AbortSignal
+    },
     callbacks: AiStreamCallbacks
   ): Promise<{ ok: boolean; error?: string }> {
     const { controller, signal } = this.beginRequest(params.signal)
     try {
       await this.ensure()
-      // 关键修复：强制使用内部绑定的模型（auto 模式必须先经 switchToRole）
-      const activeModel = this.currentModelName
-      if (!activeModel || activeModel === 'auto') {
-        const msg = '[TraeCode] provider 未绑定模型，请先调用 switchToRole（当前是 auto 模式）'
+      // 拉模式：每次请求时向治理层查询当前驻留模型（单一数据源）
+      const active = getActiveModel()
+      if (!active) {
+        const msg = '[TraeCode] 模型未驻留，请先调用 modelRegistry.switchModel(role)'
         callbacks.onError(msg)
         return { ok: false, error: msg }
       }
@@ -228,7 +234,7 @@ export class OllamaProvider implements AiProvider {
         headers: { 'Content-Type': 'application/json' },
         signal,
         body: JSON.stringify({
-          model: activeModel,
+          model: active.modelName,
           messages: wireMessages,
           stream: true,
           keep_alive: KEEP_ALIVE // 控制 GPU 驻留时长，空闲自动卸载
@@ -271,7 +277,7 @@ export class OllamaProvider implements AiProvider {
           }
         }
       }
-      callbacks.onDone({ model: `${this.id}:${params.model}` })
+      callbacks.onDone({ model: `${this.id}:${active.modelName}` })
       return { ok: true }
     } catch (err: any) {
       // 用户主动中止：UI 已取消，不再向上抛错触发回退提示
@@ -289,122 +295,9 @@ export class OllamaProvider implements AiProvider {
     for (const c of this.inflight) c.abort()
   }
 
-  /**
-   * 自适应角色切换：从可用模型中按角色画像动态选择最优模型，
-   * 通过 switchingLock 串行化，避免并发切换导致显存叠加。
-   * 卸载其他已加载模型，预热目标模型，绑定 num_ctx。
-   * 返回实际使用的模型名 + num_ctx；无可用模型返回 null。
-   */
-  async switchToRole(
-    role: ModelRole,
-    events?: { onModelSwitching?: (e: { phase: string; model: string; reason?: string }) => void },
-    signal?: AbortSignal
-  ): Promise<{ model: string; numCtx: number } | null> {
-    // 串行化：同一时刻只允许一个切换操作
-    this.switchingLock = this.switchingLock.then(() => this._doSwitchToRole(role, events, signal))
-    return this.switchingLock as Promise<{ model: string; numCtx: number } | null>
-  }
-
-  /** 暴露当前使用的模型（供 UI 显示） */
-  getActiveModel(): { name: string; role: ModelRole | null; numCtx: number } {
-    return {
-      name: this.currentModelName || '(未加载)',
-      role: this.currentRole_,
-      numCtx: this.currentNumCtx
-    }
-  }
-
-  /**
-   * 外部（modelRegistry）切换成功后同步当前驻留模型。
-   * 让 chat/chatStream 使用真实模型名，而非外部传入的 'auto'。
-   */
-  setCurrentModel(name: string, numCtx: number, role?: ModelRole): void {
-    this.currentModelName = name
-    this.currentNumCtx = numCtx
-    if (role) this.currentRole_ = role
-  }
-
-  private async _doSwitchToRole(
-    role: ModelRole,
-    events?: { onModelSwitching?: (e: { phase: string; model: string; reason?: string }) => void },
-    signal?: AbortSignal
-  ): Promise<{ model: string; numCtx: number } | null> {
-    // 探测显存（简化：默认 16GB 总量，实际可调 nvidia-smi）
-    let freeVramGB = 16
-    try {
-      const psRes = await fetch(`${HOST}/api/ps`, { signal: signal ?? AbortSignal.timeout(2000) })
-      if (psRes.ok) {
-        const data = (await psRes.json()) as { models?: Array<{ size_vram?: number }> }
-        const used = (data.models ?? []).reduce((sum, m) => sum + (m.size_vram ?? 0), 0) / 1e9
-        freeVramGB = Math.max(0, 16 - used)
-      }
-    } catch { /* 探测失败按充足处理 */ }
-
-    const choice = await selectModelForRole(role, freeVramGB, { signal })
-    if (!choice) {
-      events?.onModelSwitching?.({ phase: 'error', model: '', reason: `角色 ${role} 无可用模型` })
-      return null
-    }
-    // 调试日志：暴露选中的真实模型
-    console.log('[DEBUG][_doSwitchToRole] role =', role)
-    console.log('[DEBUG][_doSwitchToRole] choice.profile.name =', choice.profile.name)
-    console.log('[DEBUG][_doSwitchToRole] choice.numCtx =', choice.numCtx)
-    console.log('[DEBUG][_doSwitchToRole] OLLAMA_HOST =', HOST)
-
-    const targetName = choice.profile.name
-
-    // 1. 卸载除目标外的其他已加载模型
-    try {
-      const currentPs = await fetch(`${HOST}/api/ps`, { signal: signal ?? AbortSignal.timeout(2000) })
-      if (currentPs.ok) {
-        const data = (await currentPs.json()) as { models?: Array<{ name?: string }> }
-        for (const loaded of data.models ?? []) {
-          if (loaded.name && loaded.name !== targetName) {
-            events?.onModelSwitching?.({ phase: 'unloading', model: loaded.name })
-            await this.unloadModelByName(loaded.name, signal)
-          }
-        }
-      }
-    } catch { /* 卸载失败不阻塞 */ }
-
-    // 2. 预热目标模型
-    events?.onModelSwitching?.({ phase: 'loading', model: targetName, reason: choice.reason })
-    await this.warmupModelByName(targetName, choice.numCtx, signal)
-
-    events?.onModelSwitching?.({ phase: 'ready', model: targetName, reason: choice.reason })
-    this.currentModelName = targetName
-    this.currentNumCtx = choice.numCtx
-    this.currentRole_ = role
-    return { model: targetName, numCtx: choice.numCtx }
-  }
-
-  /** 强制卸载指定模型（keep_alive: 0） */
-  private async unloadModelByName(name: string, signal?: AbortSignal): Promise<void> {
-    try {
-      await fetch(`${HOST}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: signal ?? AbortSignal.timeout(5000),
-        body: JSON.stringify({ model: name, keep_alive: 0 })
-      })
-    } catch { /* 卸载失败不阻塞 */ }
-  }
-
-  /** 预热模型：1-token ping 触发权重加载，同时设置 num_ctx */
-  private async warmupModelByName(name: string, numCtx: number, signal?: AbortSignal): Promise<void> {
-    try {
-      await fetch(`${HOST}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: signal ?? AbortSignal.timeout(30_000),
-        body: JSON.stringify({
-          model: name,
-          prompt: 'ping',
-          stream: false,
-          keep_alive: KEEP_ALIVE,
-          options: { num_ctx: numCtx, num_predict: 1 }
-        })
-      })
-    } catch { /* 预热失败不阻塞：首次请求会再尝试 */ }
-  }
+  // 阶段一破坏性重构：以下方法已全部删除——
+  //   - switchToRole / _doSwitchToRole / switchingLock（切换互斥上移到 modelRegistry.switchQueue）
+  //   - setCurrentModel / getActiveModel（状态单源化到 modelRegistry，本类不再持有模型状态）
+  //   - unloadModelByName / warmupModelByName（切换逻辑已收归 modelRegistry.doSwitch）
+  // 模型选择/切换/驻留由治理层 modelRegistry 统一负责；本类只做 HTTP 请求执行。
 }

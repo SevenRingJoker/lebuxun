@@ -19,7 +19,6 @@ import {
   getValidationState,
   setValidationManifest,
   isNetworkUnreachableError,
-  nextCandidateAfterNetworkError,
   checkRecoveryGuard,
   hasForcedRecoveryTag,
   extractTargetDirFromPlan,
@@ -759,30 +758,6 @@ describe('isNetworkUnreachableError', () => {
     expect(isNetworkUnreachableError('模型输出中断：仅收到 12 token')).toBe(false)
     expect(isNetworkUnreachableError('HTTP 400: 请求参数错误')).toBe(false)
     expect(isNetworkUnreachableError('')).toBe(false)
-  })
-})
-
-describe('nextCandidateAfterNetworkError', () => {
-  it('跳过同 provider 候选，返回第一个异 provider 下标', () => {
-    const ids = ['ollama:qwen2.5-coder:7b', 'ollama:qwen2.5:14b', 'deepseek:deepseek-chat']
-    expect(nextCandidateAfterNetworkError(ids, 0)).toBe(2)
-  })
-
-  it('当前已是异 provider 前一个同 provider 时同样跳转', () => {
-    const ids = ['ollama:a', 'ollama:b', 'ollama:c', 'openai:gpt']
-    expect(nextCandidateAfterNetworkError(ids, 1)).toBe(3)
-  })
-
-  it('全部候选同 provider → -1（网络挂了切同机模型无意义，应直接终止）', () => {
-    expect(nextCandidateAfterNetworkError(['ollama:a', 'ollama:b'], 0)).toBe(-1)
-  })
-
-  it('裸 id（不含冒号）默认 ollama：与 ollama 全限定候选同 provider 不跳转', () => {
-    expect(nextCandidateAfterNetworkError(['qwen2.5-coder', 'ollama:qwen2.5:14b'], 0)).toBe(-1)
-  })
-
-  it('当前下标已是最后候选 → -1', () => {
-    expect(nextCandidateAfterNetworkError(['ollama:a', 'openai:b'], 1)).toBe(-1)
   })
 })
 

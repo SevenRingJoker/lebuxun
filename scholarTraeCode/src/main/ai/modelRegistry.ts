@@ -28,6 +28,25 @@ export function currentChoice(): ModelChoice | null {
   return current
 }
 
+/**
+ * 治理层唯一对外查询：返回当前驻留模型的快照（拉模式）。
+ * 执行层（OllamaProvider）每次发请求前必须调用此方法获取真实模型名与上下文，
+ * 不再持有任何模型状态字段——单一数据源，杜绝双写。
+ * 返回 null 表示当前无模型驻留（chat 应返回明确错误而非用 'auto'）。
+ */
+export function getActiveModel(): {
+  modelName: string
+  numCtx: number
+  role: ModelRole
+} | null {
+  if (!current || !currentRole_) return null
+  return {
+    modelName: current.profile.name,
+    numCtx: current.numCtx,
+    role: currentRole_
+  }
+}
+
 export interface SwitchResult {
   ok: true
   choice: ModelChoice
@@ -103,7 +122,9 @@ export async function switchModel(
   }
 }
 
-/** 内部切换流程：unload → warmup → 置 current → 同步 provider（调用方已持有互斥锁） */
+/** 内部切换流程：unload → warmup → 置 current（调用方已持有互斥锁）。
+ * 不再主动同步 provider —— provider 每次请求时通过 getActiveModel() 拉取，
+ * 状态单源化，杜绝双写不一致。 */
 async function doSwitch(
   target: ModelChoice,
   role: ModelRole,
@@ -118,20 +139,9 @@ async function doSwitch(
   if (!warm.ok) {
     throw new Error(`warmup ${target.profile.name} 失败：${warm.error}`)
   }
-  // 3. 置当前驻留
+  // 3. 置当前驻留（唯一状态写入点）
   current = target
-  // 4. 同步通知 provider，让 provider.chat/chatStream 用真实模型名
-  try {
-    // 延迟导入避免循环依赖
-    const { getProvider } = await import('./providerRegistry')
-    const provider = getProvider('ollama') as
-      | { setCurrentModel?: (n: string, c: number, r?: ModelRole) => void }
-      | undefined
-    provider?.setCurrentModel?.(target.profile.name, target.numCtx, role)
-    console.log(`[TraeCode] provider 同步成功：${target.profile.name} ctx=${target.numCtx} role=${role}`)
-  } catch (err) {
-    console.warn('[TraeCode] provider 同步失败（不影响切换）：', err instanceof Error ? err.message : err)
-  }
+  currentRole_ = role
 }
 
 /**

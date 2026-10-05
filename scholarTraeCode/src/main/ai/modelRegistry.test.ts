@@ -8,6 +8,7 @@ import {
   currentChoice,
   unloadCurrentModel,
   warmupModel,
+  getActiveModel,
   _resetRegistryForTest,
   _setCurrentForTest
 } from './modelRegistry'
@@ -144,6 +145,33 @@ describe('modelRegistry（自适应版）', () => {
       _setCurrentForTest(choice, 'planner')
       expect(currentRole()).toBe('planner')
       expect(currentChoice()?.profile.name).toBe('qwen3:14b')
+    })
+  })
+
+  // ============== 阶段一新增：getActiveModel + 无驻留错误路径 ==============
+
+  describe('getActiveModel', () => {
+    it('初始状态返回 null', () => {
+      const active = getActiveModel()
+      expect(active).toBeNull()
+    })
+
+    it('_setCurrentForTest 后返回正确快照', () => {
+      const choice = mkChoice('qwen3:8b', 8, 5.2, 4096)
+      _setCurrentForTest(choice, 'executor')
+      const active = getActiveModel()
+      expect(active).not.toBeNull()
+      expect(active?.modelName).toBe('qwen3:8b')
+      expect(active?.numCtx).toBe(4096)
+      expect(active?.role).toBe('executor')
+    })
+
+    it('unloadCurrentModel 后返回 null', async () => {
+      const choice = mkChoice('qwen3:8b', 8, 5.2)
+      _setCurrentForTest(choice, 'executor')
+      expect(getActiveModel()).not.toBeNull()
+      await unloadCurrentModel()
+      expect(getActiveModel()).toBeNull()
     })
   })
 })

@@ -423,7 +423,7 @@ export async function requestReplan(params: RequestReplanParams): Promise<Reques
   const start = Date.now()
   let res
   try {
-    res = await params.provider.chat({ model: params.modelName, messages })
+    res = await params.provider.chat({ messages })
   } catch {
     return null
   }

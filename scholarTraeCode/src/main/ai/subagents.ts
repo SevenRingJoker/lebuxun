@@ -286,7 +286,6 @@ async function runSummarizer(
   signal?.addEventListener('abort', onAbort)
   try {
     const res = await provider.chat({
-      model: modelName,
       messages: [
         { role: 'system', content: SUMMARIZER_PROMPT },
         { role: 'user', content: userPrompt }
@@ -455,7 +454,6 @@ async function runOne(p: RunOneParams): Promise<RunOneResult> {
     events?.onSubagent?.(index + 1, total, 'round', `第 ${round + 1}/${MAX_SUB_ROUNDS} 轮`)
 
     const res = await provider.chat({
-      model: modelName,
       messages: convo,
       tools: ollamaTools.length > 0 ? ollamaTools : undefined,
       signal: p.signal

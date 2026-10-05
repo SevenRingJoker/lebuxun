@@ -499,7 +499,8 @@ describe('requestReplan', () => {
       return { ok: true, content: '```replan\n{ "steps": [ { "content": "a" } ] }\n```' }
     })
     await requestReplan({ provider, state: makePromptState(), ...baseParams })
-    expect(captured.model).toBe('mock-model')
+    // 阶段一重构：replanner 不再向 provider 传 model 参数（由 OllamaProvider 从 Registry 拉取）
+    expect(captured.model).toBeUndefined()
     expect(captured.messages.length).toBe(1)
     expect(captured.messages[0].role).toBe('user')
     expect(captured.messages[0].content).toContain('ERESOLVE')

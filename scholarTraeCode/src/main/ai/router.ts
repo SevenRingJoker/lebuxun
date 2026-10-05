@@ -1,9 +1,8 @@
-// 任务分类与路由：
-// 1. classify() —— 用规则引擎判断请求属于哪种 TaskType（推理/补全/对话/工具）
-// 2. route()    —— 按 TaskType + 模型能力，从模型清单中挑出候选模型（按优先级排序）
-//
-// 规则刻意保持简单、可解释，便于后续替换为基于嵌入的分类器。
-import type { ModelEntry, TaskType, AiMessage } from './types'
+// 任务分类器：
+// classify() —— 用规则引擎判断请求属于哪种 TaskType（推理/补全/对话/工具）。
+// 阶段三说明：原 route() 已删除（阶段二路由统一由 AdaptiveScheduler + ModelRegistry 接管）。
+// 本文件仅保留任务分类职责；模型路由不再发生在这里。
+import type { TaskType, AiMessage } from './types'
 
 // 用户显式指定任务类型的前缀指令，命中后从消息内容中剥离
 const PREFIX_DIRECTIVES: { re: RegExp; task: TaskType }[] = [
@@ -89,51 +88,4 @@ export function classify(
   if (lower.length > 300) return { task: 'reasoning', strippedMessages: stripped }
 
   return { task: 'chat', strippedMessages: stripped }
-}
-
-/**
- * 路由：按任务类型从候选模型中挑选并排序。
- * 返回优先级从高到低的模型 id 数组（供调度器逐个尝试，失败即回退到下一个）。
- * embedding 类模型不支持 chat，一律排除出候选。
- */
-// embedding/rerank 类模型名特征：只支持向量化，不支持对话
-const NON_CHAT_MODEL = /(embed|bge-|bert|rerank|text-embedding)/i
-
-export function route(task: TaskType, models: ModelEntry[]): string[] {
-  const available = models.filter((m) => m.available && !NON_CHAT_MODEL.test(m.id))
-  if (available.length === 0) return []
-
-  const scored = available.map((m) => {
-    let score = 0
-    const c = m.capabilities
-    switch (task) {
-      case 'reasoning':
-        score += c.reasoning ? 10 : -5
-        score += c.speed === 'slow' ? 4 : c.speed === 'balanced' ? 2 : -2
-        score += c.contextWindow >= 64000 ? 2 : 0
-        score -= c.costTier // 同分时偏好便宜的
-        break
-      case 'completion':
-        // 终端命令/代码补全：强偏好代码专精模型（专业大模型）
-        score += c.code ? 10 : 0
-        score += c.speed === 'fast' ? 6 : c.speed === 'balanced' ? 4 : 0
-        score -= c.costTier * 2 // 补全高频，优先便宜
-        break
-      case 'chat':
-        score += c.speed === 'fast' ? 6 : c.speed === 'balanced' ? 8 : 2
-        score -= c.costTier
-        break
-      case 'tool':
-        // 工具调用需要能正确解析 function call，偏好 balanced 以上
-        score += c.speed === 'balanced' ? 8 : c.speed === 'fast' ? 5 : 4
-        score += c.reasoning ? 2 : 0
-        score -= c.costTier
-        break
-    }
-    return { m, score }
-  })
-
-  return scored
-    .sort((a, b) => b.score - a.score)
-    .map((s) => s.m.id)
 }

@@ -100,7 +100,13 @@ export interface AiProvider {
 
   /** 非流式聊天（用于工具调用判断、短回复）；signal 触发时底层请求须真实中止 */
   chat(params: {
-    model: string
+    /**
+     * 模型名。
+     * - 对 OllamaProvider：**已废弃**，当前驻留模型由 modelRegistry 单源维护，本参数被忽略。
+     * - 对其它 Provider（Anthropic/OpenAI 兼容等）：仍必填，由 Provider 内部消费。
+     * 调用方约定：调用 Ollama 时不传；调用其它 Provider 时显式传入。
+     */
+    model?: string
     messages: AiMessage[]
     tools?: unknown[]
     /** 取消信号：abort 后返回 { ok:false, error:'已中止' } 且底层 HTTP 请求被真正断开 */
@@ -116,7 +122,12 @@ export interface AiProvider {
 
   /** 流式聊天；provider 通过 callbacks 推送结果，返回最终是否成功；signal 语义同 chat */
   chatStream(
-    params: { model: string; messages: AiMessage[]; signal?: AbortSignal },
+    params: {
+      /** 同 chat 的 model 参数说明：Ollama 忽略，其它 Provider 必填 */
+      model?: string
+      messages: AiMessage[]
+      signal?: AbortSignal
+    },
     callbacks: AiStreamCallbacks
   ): Promise<{ ok: boolean; error?: string }>
 

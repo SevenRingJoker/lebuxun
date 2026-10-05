@@ -1,6 +1,11 @@
 // 显存监控层：封装 Ollama /api/ps 探测，带 500ms 缓存与失败宽容。
 // 原则：探测层永远不许阻塞调度——任何异常/超时/字段缺失都按「显存充足」处理。
 // 零 Electron 依赖，纯 fetch + 常量，便于单测 mock。
+//
+// 调用约束（阶段三收归）：
+// - getFreeVram / listLoadedModels 等显存探测接口，只允许 modelRegistry 与 vramMonitor 内部调用。
+// - 决策层（adaptiveScheduler）不直接调用，由治理层通过 resolveModelForTask 注入。
+// - 其它模块（含 IPC handler）一律通过 modelRegistry / adaptiveScheduler 公开接口访问。
 
 /** 单模型驻留信息（/api/ps 返回项的子集） */
 export interface LoadedModelInfo {

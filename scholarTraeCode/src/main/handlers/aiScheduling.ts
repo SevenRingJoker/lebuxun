@@ -64,11 +64,9 @@ import type { ModelEntry, SchedulerChatParams } from '../ai/types'
 import { clearStaging } from './staging'
 // 自适应模型发现与调度：模型清单/角色选择完全由 Ollama 动态发现驱动
 import { pingOllama, listOllamaModels, listLoadedModels } from '../ai/modelDiscovery'
-import {
-  getFreeVram,
-  selectModelForRoleWithDiagnostics,
-  type ModelRole
-} from '../ai/adaptiveScheduler'
+// 阶段三收归：不再直接调 getFreeVram / selectModelForRoleWithDiagnostics，
+// 改走决策层唯一入口 resolveModelForTask（内部完成显存探测 + 角色选择）。
+import { resolveModelForTask, type ModelRole } from '../ai/adaptiveScheduler'
 
 // 待决审批请求表：id → 释放函数。前端应答 ai:permissionResponse 后放行对应工具
 const pendingPermissions = new Map<string, (r: UserPermissionResponse) => void>()
@@ -841,8 +839,7 @@ export function registerAiSchedulingHandlers(): void {
 
   // 诊断角色 → 模型的选择（UI 可展示为什么选了某模型 / 为什么没选）
   ipcMain.handle('ai:diagnoseRoleSelection', async (_e, role: string) => {
-    const freeVram = await getFreeVram()
-    return selectModelForRoleWithDiagnostics(role as ModelRole, freeVram)
+    return resolveModelForTask(role as ModelRole)
   })
 
   // 查询当前已加载模型（含显存占用）

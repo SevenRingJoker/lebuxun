@@ -10,7 +10,13 @@ import {
 
 export type ModelRole = 'planner' | 'executor' | 'coder' | 'observer'
 
-/** 角色需求画像（不指定具体模型，只描述能力要求） */
+/** 角色需求画像（不指定具体模型，只描述能力要求）。
+ * 阶段三统一：字段名与 modelDiscovery.ModelProfile 一一对应——
+ *   minParams/maxParams ↔ ModelProfile.paramSize（参数量 B）
+ *   preferCoder        ↔ ModelProfile.isCoder（是否代码专用）
+ *   preferFamily       ↔ ModelProfile.family（家族标识：qwen/deepseek/llama/...）
+ *   targetCtx/minCtx   ↔ 上下文窗口档位（RoleRequirement 特有，用于显存估算）
+ * 确保两处共享同一套能力语义，避免双写漂移。 */
 interface RoleRequirement {
   /** 最低参数量（B）：太小无法胜任 */
   minParams: number
@@ -123,6 +129,22 @@ export async function selectModelForRole(
 ): Promise<ModelChoice | null> {
   const diag = await selectModelForRoleWithDiagnostics(role, availableVram, opts)
   return diag.choice
+}
+
+/**
+ * 决策层唯一对外入口：根据任务角色 + 当前显存 → 给出最终 ModelChoice（含诊断）。
+ * 内部完成：可用显存探测 → 候选过滤 → 显存档位递减。
+ * 调用方拿到 SelectionDiagnostics 后自行决定后续动作（通常是交给 ModelRegistry.switchModel）。
+ *
+ * 注意：本方法只负责「选谁」，不负责「加载/切换」——那是治理层 ModelRegistry 的职责。
+ * 阶段二之后，scheduler 不再关心候选列表回退，只需调用本方法 + safeSwitch。
+ */
+export async function resolveModelForTask(
+  role: ModelRole,
+  opts?: { signal?: AbortSignal; fetchImpl?: typeof fetch }
+): Promise<SelectionDiagnostics> {
+  const freeVram = await getFreeVram(opts)
+  return selectModelForRoleWithDiagnostics(role, freeVram, opts)
 }
 
 /**

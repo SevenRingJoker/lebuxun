@@ -6,8 +6,8 @@ import type {
   SchedulerChatParams,
   TaskType
 } from './types'
-import { classify, route } from './router'
-import { getCachedModels, getProvider, parseModelId, refreshModels } from './providerRegistry'
+import { classify } from './router'
+import { getCachedModels, getProvider } from './providerRegistry'
 import { collectTools, callMcpTool, listMcpServers, type McpToolEntry } from '../handlers/mcpToolBridge'
 import { buildAgentPrompt, buildAgentsMd, buildRulesMd, renderNotes, type PromptContext } from './promptBuilder'
 import { dirname, relative, sep, extname, resolve, isAbsolute, join } from 'node:path'
@@ -236,6 +236,27 @@ const NETWORK_UNREACHABLE_HINT =
   '请检查 Ollama 服务是否正常运行（默认地址 http://127.0.0.1:11434，可在设置中确认端点与模型），服务恢复后再重试；本次不会自动切换模型。'
 
 /**
+ * 阶段二 · TaskType → ModelRole 映射（决策层职责）。
+ * classify() 推断的粗粒度任务类型，映射到三模型分时复用的具体角色：
+ * - reasoning → planner（深度推理 / 规划，需要大模型 + 长上下文）
+ * - completion → coder（代码补全 / 终端命令，偏好代码专精模型）
+ * - tool → executor（工具循环，要求稳定 + 平衡）
+ * - chat → executor（普通对话，最轻量稳定模型即可）
+ */
+function taskTypeToModelRole(taskType: TaskType): ModelRole {
+  switch (taskType) {
+    case 'reasoning':
+      return 'planner'
+    case 'completion':
+      return 'coder'
+    case 'tool':
+    case 'chat':
+    default:
+      return 'executor'
+  }
+}
+
+/**
  * 任务物理中断错误：planDrift 确认关键产物缺失（hasBlock）后，工具循环不再
  * 自动重规划/续跑/切换候选模型，直接抛错到包装层终止整个任务，等待用户显式重试。
  */
@@ -246,49 +267,15 @@ export class TaskBlockedError extends Error {
   }
 }
 
-/** 解析候选模型列表：显式指定时把该模型排首位，其后附加自动路由候选作为回退兜底 */
-async function resolveCandidates(taskType: TaskType, model?: string): Promise<string[]> {
-  let models = getCachedModels()
-  if (models.length === 0) models = await refreshModels()
-
-  // 三模型模式：候选回退循环 bypass，固定单候选 ollama（后续由 modelRegistry 角色切换接管具体模型）。
-  const availableIds = models.filter((m) => m.available).map((m) => m.id)
-  if (isThreeModelMode(availableIds)) {
-    return ['ollama:auto']
-  }
-
-  const routed = route(taskType, models)
-
-  let ids: string[]
-  if (model && model !== 'auto') {
-    // 手动指定的模型优先；失败/超时后仍可回退到其余自动候选（带 onFallback 提示）
-    ids = [model, ...routed.filter((id) => id !== model)]
-  } else {
-    ids = routed
-  }
-  // 去重兜底：模型清单异常（同 id 重复注册）时杜绝「A → A」无效回退
-  return Array.from(new Set(ids))
-}
+/** 解析候选模型列表（已删除）：阶段二之后由 ModelRegistry.safeSwitch 内部按角色自适应选择 */
+/* resolveCandidates / nextCandidateAfterNetworkError 已删除：阶段二统一路由，候选回退循环由 safeSwitch 内部 executor 兜底接管 */
 
 /**
- * 网络故障回退决策（纯函数）：返回下一个应尝试的候选下标；-1 表示终止（不再切换）。
- * 同一 provider 的其他候选同样打不到已不可达的服务，必须跳到「不同 provider」的候选；
- * 若剩余候选全部属于当前 provider，则终止并提示检查服务。
- */
-export function nextCandidateAfterNetworkError(
-  candidateIds: string[],
-  currentIndex: number
-): number {
-  const currentProvider = parseModelId(candidateIds[currentIndex]).providerId
-  for (let j = currentIndex + 1; j < candidateIds.length; j++) {
-    if (parseModelId(candidateIds[j]).providerId !== currentProvider) return j
-  }
-  return -1
-}
-
-/**
- * 流式聊天：支持自动路由、显式模型、首 token 超时回退。
- * 通过 callbacks 推送 token、完成事件；错误仅在所有候选都失败后上报一次。
+ * 阶段二 · 流式聊天：统一路由走 AdaptiveScheduler + ModelRegistry。
+ * 1. classify 推断 TaskType → 映射到 ModelRole
+ * 2. safeSwitch(role) 切换驻留模型（内部自适应选择 + executor 兜底）
+ * 3. 直接调用 OllamaProvider.chatStream，不再做候选回退循环
+ * 网络不可达等错误由底层直接抛出；safeSwitch 已在角色维度兜底。
  */
 export async function scheduleChatStream(
   params: SchedulerChatParams,
@@ -300,90 +287,80 @@ export async function scheduleChatStream(
     currentFile: params.currentFile,
     hint: params.taskType
   })
+  const role = taskTypeToModelRole(taskType)
 
-  const candidateIds = await resolveCandidates(taskType, params.model)
-  if (candidateIds.length === 0) {
-    callbacks.onError('没有可用的模型，请确认 Ollama 已运行且已安装模型')
+  // 阶段二：safeSwitch 内部完成自适应模型选择 + executor 兜底；
+  // 降级时触发 onFallback，提示前端当前用 executor 顶替原角色。
+  const sw = await safeSwitch(role, {
+    signal,
+    onSwitch: (from, to, degraded) => {
+      if (degraded) {
+        callbacks.onFallback?.(
+          from ?? role,
+          to,
+          `角色 ${role} 无可用模型，已降级到 ${to} 兜底`
+        )
+      }
+    }
+  })
+  if (!sw.ok) {
+    callbacks.onError(`没有可用的模型，请确认 Ollama 已运行且已安装模型：${sw.error}`)
+    return
+  }
+
+  const modelName = sw.choice.profile.name
+  const provider = getProvider('ollama')
+  if (!provider) {
+    callbacks.onError('Ollama 供应商未就绪')
     return
   }
 
   const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT
-  let lastError = ''
-
-  let i = 0
-  while (i < candidateIds.length) {
-    const modelId = candidateIds[i]
-    const { providerId, modelName } = parseModelId(modelId)
-    const provider = getProvider(providerId)
-    if (!provider) {
-      lastError = `未知供应商 ${providerId}`
-      i++
-      continue
+  // 用量记账：onUsage 真实统计优先；provider 未上报时按字符数估算兜底
+  let usageReported = false
+  let outText = ''
+  const tracking: AiStreamCallbacks = {
+    onChunk: (d) => {
+      outText += d
+      callbacks.onChunk(d)
+    },
+    onDone: callbacks.onDone,
+    onError: callbacks.onError,
+    onFallback: callbacks.onFallback,
+    onUsage: (u) => {
+      usageReported = true
+      trackChatUsage(`ollama:${modelName}`, u, '', '')
     }
-
-    // 回退提示（非首个候选时）
-    if (i > 0) callbacks.onFallback?.(candidateIds[i - 1], modelId, lastError)
-
-    // 网络故障决策：同 provider 候选一律跳过；没有异 provider 候选时直接终止，
-    // 不做无意义的同名/同服务切换（由 networkSkip 控制跳转下标）
-    let networkSkip = -1
-    try {
-      // 用量记账：onUsage 真实统计优先；provider 未上报时按字符数估算兜底
-      let usageReported = false
-      let outText = ''
-      const tracking: AiStreamCallbacks = {
-        onChunk: (d) => {
-          outText += d
-          callbacks.onChunk(d)
-        },
-        onDone: callbacks.onDone,
-        onError: callbacks.onError,
-        onFallback: callbacks.onFallback,
-        onUsage: (u) => {
-          usageReported = true
-          trackChatUsage(modelId, u, '', '')
-        }
-      }
-      const result = await withFirstTokenTimeout(
-        (cb) => provider.chatStream({ model: modelName, messages: strippedMessages, signal }, cb),
-        tracking,
-        timeoutMs
-      )
-      if (result.ok) {
-        if (!usageReported) {
-          const inText = strippedMessages.map((m) => m.content).join('\n')
-          trackChatUsage(modelId, undefined, inText, outText)
-        }
-        return
-      }
-      lastError = result.error || '模型调用失败'
-      // 用户主动停止：立即退出，不再尝试回退候选
-      if (signal?.aborted || lastError === '已中止') return
-      if (isNetworkUnreachableError(lastError)) {
-        networkSkip = nextCandidateAfterNetworkError(candidateIds, i)
-      }
-    } catch (err: any) {
-      lastError = err?.message || String(err)
-      // 尽力终止僵尸请求，避免继续占用推理资源
-      provider.abort?.()
-      if (signal?.aborted) return
-      if (isNetworkUnreachableError(lastError)) {
-        networkSkip = nextCandidateAfterNetworkError(candidateIds, i)
-      }
-    }
-    // 网络层故障且无其他供应商可试：立即终止并明确提示检查服务，绝不回退到同一服务的另一个模型
-    if (isNetworkUnreachableError(lastError)) {
-      if (networkSkip < 0) {
-        callbacks.onError(`${NETWORK_UNREACHABLE_HINT}（最后错误：${lastError}）`)
-        return
-      }
-      i = networkSkip
-      continue
-    }
-    i++
   }
 
-  callbacks.onError(`所有候选模型均不可用：${lastError || '未知错误'}`)
+  try {
+    const result = await withFirstTokenTimeout(
+      (cb) => provider.chatStream({ messages: strippedMessages, signal }, cb),
+      tracking,
+      timeoutMs
+    )
+    if (result.ok) {
+      if (!usageReported) {
+        const inText = strippedMessages.map((m) => m.content).join('\n')
+        trackChatUsage(`ollama:${modelName}`, undefined, inText, outText)
+      }
+      return
+    }
+    // 网络不可达：直接终止并提示检查服务（safeSwitch 已在角色层面兜底，无需再切模型）
+    if (isNetworkUnreachableError(result.error || '')) {
+      callbacks.onError(`${NETWORK_UNREACHABLE_HINT}（最后错误：${result.error}）`)
+      return
+    }
+    callbacks.onError(`模型调用失败：${result.error || '未知错误'}`)
+  } catch (err: any) {
+    const lastError = err?.message || String(err)
+    provider.abort?.()
+    if (isNetworkUnreachableError(lastError)) {
+      callbacks.onError(`${NETWORK_UNREACHABLE_HINT}（最后错误：${lastError}）`)
+      return
+    }
+    callbacks.onError(`模型调用异常：${lastError}`)
+  }
 }
 
 /** 工具流过程事件：透传给渲染进程展示「正在调用工具 → 结果」 */
@@ -466,12 +443,11 @@ async function generatePlan(
   /** 取消信号：用户停止时真中断规划请求（2.2） */
   signal?: AbortSignal
 ): Promise<string | null> {
-  // 路由到 reasoning 模型
-  const reasoningIds = await resolveCandidates('reasoning')
-  if (reasoningIds.length === 0) return null
-
-  const { providerId, modelName } = parseModelId(reasoningIds[0])
-  const provider = getProvider(providerId)
+  // 阶段二：切到 Planner 角色（决策层统一入口，safeSwitch 内部 executor 兜底）
+  const sw = await safeSwitch('planner', { signal })
+  if (!sw.ok) return null
+  const plannerName = sw.choice.profile.name
+  const provider = getProvider('ollama')
   if (!provider) return null
 
   const lastUser = strippedMessages[strippedMessages.length - 1]
@@ -520,14 +496,13 @@ async function generatePlan(
 方式一也可追加自定义 rules：{ "template": "go-project", "rules": [ { "id": "custom", "description": "...", "kind": "fileExists", "path": "..." } ] }。
 manifest 的 rules 应覆盖本任务全部关键产物（如 package.json / src/main.js / src/App.vue 走 fileExists，npm install / npm run serve 走 commandExecuted）。无 path/command 的规则字段可省略。`
   events?.onToolCall?.('plan', { prompt: 'reasoning model 规划中' })
-  events?.onModelCall?.(modelName, '规划')
+  events?.onModelCall?.(plannerName, '规划')
   try {
     const res = await provider.chat({
-      model: modelName,
       messages: [{ role: 'user', content: planPrompt }],
       signal
     })
-    trackChatUsage(`${providerId}:${modelName}`, res.usage, planPrompt, res.content || '')
+    trackChatUsage(`ollama:${plannerName}`, res.usage, planPrompt, res.content || '')
     events?.onToolResult?.('plan', res.content || '')
     return res.ok ? res.content || null : null
   } catch {
@@ -604,7 +579,6 @@ async function generateDagPlan(
 
   try {
     const res = await provider.chat({
-      model: modelName,
       messages: [{ role: 'user', content: dagPrompt }],
       signal
     })
@@ -848,11 +822,7 @@ export async function scheduleChatWithTools(
   })
   const taskType: TaskType = classified.task === 'chat' ? 'tool' : classified.task
   const { strippedMessages } = classified
-
-  const candidateIds = await resolveCandidates(taskType, params.model)
-  if (candidateIds.length === 0) {
-    return { ok: false, error: '没有可用的模型' }
-  }
+  const role = taskTypeToModelRole(taskType)
 
   const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT
   const tools = await collectTools()
@@ -903,109 +873,114 @@ export async function scheduleChatWithTools(
     }
   }
 
-  for (let i = 0; i < candidateIds.length; i++) {
-    const modelId = candidateIds[i]
-    const { providerId, modelName } = parseModelId(modelId)
-    const provider = getProvider(providerId)
-    if (!provider) {
-      lastError = `未知供应商 ${providerId}`
-      continue
-    }
-    if (i > 0) events?.onFallback?.(candidateIds[i - 1], modelId, lastError)
-
-    // 记录本包装器启动时刻：整体成功后用于清理回退过程中残留的中断快照
-    const wrapperStart = Date.now()
-
-    // ㊜ 1c 每次尝试一个独立 abort：外部 signal（停止/放弃）与整体超时都汇总到这里，
-    // 再透传给底层循环——超时不再只 reject 包装器，底层必须同步退出。
-    const attemptAbort = new AbortController()
-    const abortFromExternal = () => attemptAbort.abort(signal?.reason)
-    if (signal) {
-      if (signal.aborted) abortFromExternal()
-      signal.addEventListener('abort', abortFromExternal)
-    }
-    // 先持有底层引用：catch 后必须 await 它真正退出，才能启动下一候选（候选串行化）
-    let runPromise: Promise<string> | null = null
-    try {
-      runPromise = runWithTools(
-        provider,
-        modelName,
-        strippedMessages,
-        tools,
-        events,
-        params.workspace,
-        plan,
-        agentsMd,
-        rulesText,
-        notesText,
-        params.currentFile ?? null,
-        attemptAbort.signal,
-        traceDir,
-        environmentReport,
-        taskControl,
-        undefined,
-        gate
-      )
-      const content = await withToolsTimeout(
-        runPromise,
-        timeoutMs * (MAX_TOOL_ROUNDS + 1),
-        gate
-      )
-      // 回退候选最终成功：清掉本次包装器期间失败候选留下的中断快照，
-      // 避免恢复条出现「实际已被后续模型完成」的脏任务
-      if (taskControl) pruneInterruptedSince(taskControl.workspace, wrapperStart)
-      return { ok: true, content, model: modelId }
-    } catch (err: any) {
-      lastError = err?.message || String(err)
-      // 物理阻断（关键产物缺失）：任务已被强制终止，不 abort、不切换候选模型，
-      // 直接把 blocked 结果交回前端（偏差卡片 + 重试按钮），杜绝换个模型继续盲改
-      if (err instanceof TaskBlockedError) {
-        return { ok: false, blocked: true, content: err.message, model: modelId }
+  // 阶段二：切换到目标角色（自适应选择 + executor 兜底）
+  const sw = await safeSwitch(role, {
+    signal,
+    onSwitch: (from, to, degraded) => {
+      if (degraded) {
+        events?.onFallback?.(
+          from ?? role,
+          to,
+          `角色 ${role} 无可用模型，已降级到 ${to} 兜底`
+        )
       }
-      // 网络层故障：同 provider 候选必再失败，只允许跳到不同 provider；没有则直接终止
-      if (isNetworkUnreachableError(lastError)) {
-        const next = nextCandidateAfterNetworkError(candidateIds, i)
-        if (next < 0) {
-          return { ok: false, error: `${NETWORK_UNREACHABLE_HINT}（最后错误：${lastError}）` }
-        }
-        // 串行化等底层退出后跳到异 provider 候选（i++ 会再前进一格，故先置 next-1）
-        attemptAbort.abort(new TimeoutBudgetError())
-        provider.abort?.()
-        if (runPromise) {
-          try {
-            await runPromise
-          } catch {
-            // 底层结局不影响跳转
-          }
-        }
-        i = next - 1
-        continue
-      }
-      // 超时/出错都通知底层：循环在途时让它在最近安全点退出；
-      // 以超时为 abort 原因 → 循环落 interrupted 快照（全部候选失败时恢复条可续跑）
+    }
+  })
+  if (!sw.ok) {
+    return { ok: false, error: `没有可用的模型：${sw.error}` }
+  }
+  const modelName = sw.choice.profile.name
+  const provider = getProvider('ollama')
+  if (!provider) {
+    return { ok: false, error: 'Ollama 供应商未就绪' }
+  }
+  const modelId = `ollama:${modelName}`
+
+  // 记录本包装器启动时刻：整体成功后用于清理回退过程中残留的中断快照
+  const wrapperStart = Date.now()
+
+  // ㊜ 1c 每次尝试一个独立 abort：外部 signal（停止/放弃）与整体超时都汇总到这里，
+  // 再透传给底层循环——超时不再只 reject 包装器，底层必须同步退出。
+  const attemptAbort = new AbortController()
+  const abortFromExternal = () => attemptAbort.abort(signal?.reason)
+  if (signal) {
+    if (signal.aborted) abortFromExternal()
+    signal.addEventListener('abort', abortFromExternal)
+  }
+  // 先持有底层引用：catch 后必须 await 它真正退出
+  let runPromise: Promise<string> | null = null
+  try {
+    runPromise = runWithTools(
+      provider,
+      modelName,
+      strippedMessages,
+      tools,
+      events,
+      params.workspace,
+      plan,
+      agentsMd,
+      rulesText,
+      notesText,
+      params.currentFile ?? null,
+      attemptAbort.signal,
+      traceDir,
+      environmentReport,
+      taskControl,
+      undefined,
+      gate
+    )
+    const content = await withToolsTimeout(
+      runPromise,
+      timeoutMs * (MAX_TOOL_ROUNDS + 1),
+      gate
+    )
+    // 任务成功：清掉本次包装器期间失败候选留下的中断快照，
+    // 避免恢复条出现「实际已被后续模型完成」的脏任务
+    if (taskControl) pruneInterruptedSince(taskControl.workspace, wrapperStart)
+    return { ok: true, content, model: modelId }
+  } catch (err: any) {
+    lastError = err?.message || String(err)
+    // 物理阻断（关键产物缺失）：任务已被强制终止，不 abort、不切换候选模型，
+    // 直接把 blocked 结果交回前端（偏差卡片 + 重试按钮），杜绝换个模型继续盲改
+    if (err instanceof TaskBlockedError) {
+      return { ok: false, blocked: true, content: err.message, model: modelId }
+    }
+    // 网络层故障：直接终止（safeSwitch 已在角色层面兜底，无需切换模型）
+    if (isNetworkUnreachableError(lastError)) {
       attemptAbort.abort(new TimeoutBudgetError())
       provider.abort?.()
-      // 串行化：老循环不退出绝不启动下一候选，杜绝两个循环并发执行副作用（孤儿事故根因）
       if (runPromise) {
         try {
           await runPromise
         } catch {
-          // 底层以 abort/error 收尾，其结局不影响候选回退
+          // 底层结局不影响错误返回
         }
       }
-    } finally {
-      signal?.removeEventListener('abort', abortFromExternal)
+      return { ok: false, error: `${NETWORK_UNREACHABLE_HINT}（最后错误：${lastError}）` }
     }
+    // 超时/出错都通知底层：循环在途时让它在最近安全点退出；
+    // 以超时为 abort 原因 → 循环落 interrupted 快照（恢复条可续跑）
+    attemptAbort.abort(new TimeoutBudgetError())
+    provider.abort?.()
+    if (runPromise) {
+      try {
+        await runPromise
+      } catch {
+        // 底层以 abort/error 收尾，其结局不影响错误返回
+      }
+    }
+    return { ok: false, error: `模型调用失败：${lastError}` }
+  } finally {
+    signal?.removeEventListener('abort', abortFromExternal)
   }
-  return { ok: false, error: `所有候选模型均不可用：${lastError}` }
 }
 
 /**
  * ㊜ 断点续跑入口：从任务快照恢复未完成任务。
  * 与 scheduleChatWithTools 的关键差异：
  * - 跳过分类与规划（plan/manifest/用户请求均已在快照内）；
- * - 必须回到原模型（snapshot.modelId），不做候选解析与隐式回退，避免续跑行为漂移；
- * - 原模型不可用时直接报错，由前端引导用户重新发起任务。
+ * - 阶段二之后不再依赖 snapshot.modelId 恢复原模型，统一走 safeSwitch(executor)
+ *   让治理层选择当前最优驻留模型；返回真实驻留的模型 id 供前端展示。
  */
 export async function scheduleTaskResume(
   snapshot: ParsedTaskSnapshot,
@@ -1020,11 +995,18 @@ export async function scheduleTaskResume(
    */
   fromRound?: number
 ): Promise<{ ok: boolean; content?: string; error?: string; model?: string; blocked?: boolean }> {
-  const { providerId, modelName } = parseModelId(snapshot.modelId)
-  const provider = getProvider(providerId)
-  if (!provider) {
-    return { ok: false, error: '原模型已不可用，请重新发起任务' }
+  // 阶段二：续跑同样走统一角色调度（工具循环 → executor）
+  const sw = await safeSwitch('executor', { signal })
+  if (!sw.ok) {
+    return { ok: false, error: `续跑模型不可用：${sw.error}` }
   }
+  const modelName = sw.choice.profile.name
+  const provider = getProvider('ollama')
+  if (!provider) {
+    return { ok: false, error: 'Ollama 供应商未就绪' }
+  }
+  const modelId = `ollama:${modelName}`
+
   const tools = await collectTools()
   const taskControl: TaskControlOptions = {
     workspace: snapshot.workspace,
@@ -1069,13 +1051,13 @@ export async function scheduleTaskResume(
       DEFAULT_TIMEOUT * (MAX_TOOL_ROUNDS + 1),
       gate
     )
-    return { ok: true, content, model: snapshot.modelId }
+    return { ok: true, content, model: modelId }
   } catch (err: any) {
     // 物理阻断：续跑同样在关键产物缺失时直接终止，交前端偏差卡片 + 重试
     if (err instanceof TaskBlockedError) {
-      return { ok: false, blocked: true, content: err.message, model: snapshot.modelId }
+      return { ok: false, blocked: true, content: err.message, model: modelId }
     }
-    // 通知底层在安全点退出，等它收尾后再返回错误（续跑入口无下一候选）
+    // 通知底层在安全点退出，等它收尾后再返回错误
     attemptAbort.abort(new TimeoutBudgetError())
     provider.abort?.()
     if (runPromise) {
@@ -1432,7 +1414,6 @@ async function runWithTools(
   const summarize: Summarizer = async (text) => {
     try {
       const res = await provider.chat({
-        model: modelName,
         messages: [{
           role: 'user',
           content: `请用一段纯中文摘要以下对话的关键信息和已完成的工作，保留文件路径、命令和结果要点：\n\n${text}`
@@ -1691,7 +1672,6 @@ async function runWithTools(
 
     events?.onModelCall?.(modelName, round === 0 ? '执行' : `第${round + 1}轮`)
     const res = await provider.chat({
-      model: modelName,
       messages: current,
       tools: ollamaTools.length > 0 ? ollamaTools : undefined,
       signal
@@ -3361,7 +3341,6 @@ async function runWithDag(
       const compacted = await compactIfNeeded(convo, async (text) => {
         try {
           const res = await provider.chat({
-            model: modelName,
             messages: [{ role: 'user', content: `请用一段纯中文摘要以下对话的关键信息：\n\n${text}` }],
             signal
           })
@@ -3375,7 +3354,6 @@ async function runWithDag(
       events?.onModelCall?.(modelName, round === 0 ? '执行' : `第${round + 1}轮`)
 
       const res = await provider.chat({
-        model: modelName,
         messages: current,
         tools: ollamaTools.length > 0 ? ollamaTools : undefined,
         signal
@@ -3657,7 +3635,6 @@ async function runObserverIntervention(
 
   const prompt = buildObserverPrompt(failedPath, trace, ctxSummary)
   const res = await provider.chat({
-    model: plannerModel,
     messages: [
       { role: 'system', content: '你是任务诊断专家，只输出 JSON 格式的诊断结论。' },
       { role: 'user', content: prompt }
@@ -3736,7 +3713,6 @@ async function runSemanticValidation(
 
   const prompt = buildCoderRepairPrompt(issues, files)
   const res = await provider.chat({
-    model: coderModel,
     messages: [
       { role: 'system', content: roleEnvironmentHint('coder', targetDir) },
       { role: 'user', content: prompt }
@@ -3810,7 +3786,6 @@ async function runRuntimeValidation(
     Array.from(ctx.createdFiles)
   )
   const res = await provider.chat({
-    model: plannerModel,
     messages: [
       { role: 'system', content: '你是任务诊断专家，只输出 JSON 格式的诊断结论。' },
       { role: 'user', content: diagnosis }
@@ -3880,7 +3855,6 @@ async function runCoderForNode(
   }
 
   const res = await provider.chat({
-    model: coderModel,
     messages: [
       { role: 'system', content: roleEnvironmentHint('coder', targetDir) },
       { role: 'user', content: prompt }
