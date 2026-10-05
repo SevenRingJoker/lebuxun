@@ -26,6 +26,14 @@ import { registerScholarHandlers } from './handlers/scholar'
 import { registerPreviewHandlers } from './preview/previewView'
 import { loadPlugins } from './ai/pluginLoader'
 
+// 全局未捕获异常捕获：暴露 .modelName 等运行时错误的完整调用栈
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT-EXCEPTION]', err.stack || err.message)
+})
+process.on('unhandledRejection', (err: unknown) => {
+  console.error('[UNHANDLED-REJECTION]', (err as Error)?.stack || String(err))
+})
+
 // 主题名（与渲染进程 stores/theme.ts 保持一致）
 type ThemeName = 'light' | 'dark' | 'blue'
 

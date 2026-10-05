@@ -94,7 +94,7 @@ export async function switchModel(
       return { ok: true, choice: current, degraded: false }
     }
 
-    await doSwitch(choice, opts)
+    await doSwitch(choice, role, opts)
     currentRole_ = role
     opts?.onSwitch?.(currentRole_, role, false)
     return { ok: true, choice, degraded: false }
@@ -103,9 +103,10 @@ export async function switchModel(
   }
 }
 
-/** 内部切换流程：unload → warmup → 置 current（调用方已持有互斥锁） */
+/** 内部切换流程：unload → warmup → 置 current → 同步 provider（调用方已持有互斥锁） */
 async function doSwitch(
   target: ModelChoice,
+  role: ModelRole,
   opts?: { signal?: AbortSignal }
 ): Promise<void> {
   // 1. 卸载当前（若有）
@@ -119,6 +120,18 @@ async function doSwitch(
   }
   // 3. 置当前驻留
   current = target
+  // 4. 同步通知 provider，让 provider.chat/chatStream 用真实模型名
+  try {
+    // 延迟导入避免循环依赖
+    const { getProvider } = await import('./providerRegistry')
+    const provider = getProvider('ollama') as
+      | { setCurrentModel?: (n: string, c: number, r?: ModelRole) => void }
+      | undefined
+    provider?.setCurrentModel?.(target.profile.name, target.numCtx, role)
+    console.log(`[TraeCode] provider 同步成功：${target.profile.name} ctx=${target.numCtx} role=${role}`)
+  } catch (err) {
+    console.warn('[TraeCode] provider 同步失败（不影响切换）：', err instanceof Error ? err.message : err)
+  }
 }
 
 /**

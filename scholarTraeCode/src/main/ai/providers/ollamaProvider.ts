@@ -159,10 +159,13 @@ export class OllamaProvider implements AiProvider {
     const { controller, signal } = this.beginRequest(params.signal)
     try {
       await this.ensure()
-      // 关键修复：使用 switchToRole 动态选择的当前模型，而非外部传入的硬编码 model
+      // 关键修复：强制使用内部绑定的模型（auto 模式必须先经 switchToRole）
       const activeModel = this.currentModelName
-      if (!activeModel) {
-        return { ok: false, error: '[TraeCode] 尚未选择模型，请先调用 switchToRole' }
+      if (!activeModel || activeModel === 'auto') {
+        return {
+          ok: false,
+          error: '[TraeCode] provider 未绑定模型，请先调用 switchToRole（当前是 auto 模式）'
+        }
       }
       // 2.3 parts 消息转 Ollama 线协议（无 parts 原样透传）
       const wireMessages = await toOllamaMessages(params.messages)
@@ -211,11 +214,12 @@ export class OllamaProvider implements AiProvider {
     const { controller, signal } = this.beginRequest(params.signal)
     try {
       await this.ensure()
-      // 关键修复：使用 switchToRole 动态选择的当前模型，而非外部传入的硬编码 model
+      // 关键修复：强制使用内部绑定的模型（auto 模式必须先经 switchToRole）
       const activeModel = this.currentModelName
-      if (!activeModel) {
-        callbacks.onError('[TraeCode] 尚未选择模型，请先调用 switchToRole')
-        return { ok: false, error: '[TraeCode] 尚未选择模型，请先调用 switchToRole' }
+      if (!activeModel || activeModel === 'auto') {
+        const msg = '[TraeCode] provider 未绑定模型，请先调用 switchToRole（当前是 auto 模式）'
+        callbacks.onError(msg)
+        return { ok: false, error: msg }
       }
       // 2.3 parts 消息转 Ollama 线协议
       const wireMessages = await toOllamaMessages(params.messages)
@@ -310,6 +314,16 @@ export class OllamaProvider implements AiProvider {
     }
   }
 
+  /**
+   * 外部（modelRegistry）切换成功后同步当前驻留模型。
+   * 让 chat/chatStream 使用真实模型名，而非外部传入的 'auto'。
+   */
+  setCurrentModel(name: string, numCtx: number, role?: ModelRole): void {
+    this.currentModelName = name
+    this.currentNumCtx = numCtx
+    if (role) this.currentRole_ = role
+  }
+
   private async _doSwitchToRole(
     role: ModelRole,
     events?: { onModelSwitching?: (e: { phase: string; model: string; reason?: string }) => void },
@@ -331,6 +345,11 @@ export class OllamaProvider implements AiProvider {
       events?.onModelSwitching?.({ phase: 'error', model: '', reason: `角色 ${role} 无可用模型` })
       return null
     }
+    // 调试日志：暴露选中的真实模型
+    console.log('[DEBUG][_doSwitchToRole] role =', role)
+    console.log('[DEBUG][_doSwitchToRole] choice.profile.name =', choice.profile.name)
+    console.log('[DEBUG][_doSwitchToRole] choice.numCtx =', choice.numCtx)
+    console.log('[DEBUG][_doSwitchToRole] OLLAMA_HOST =', HOST)
 
     const targetName = choice.profile.name
 
