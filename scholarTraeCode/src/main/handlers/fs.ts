@@ -29,10 +29,8 @@ async function readDirTree(root: string, depth = 6): Promise<FsNode[]> {
     if (ignore.has(entry.name)) continue
     const fullPath = join(root, entry.name)
     if (entry.isDirectory()) {
-      // node_modules 不递归读取（避免加载数千个依赖包），只显示文件夹本身
-      const children = entry.name === 'node_modules'
-        ? []
-        : await readDirTree(fullPath, depth - 1)
+      // node_modules 与其他目录同等对待，完全递归展开
+      const children = await readDirTree(fullPath, depth - 1)
       nodes.push({
         name: entry.name,
         path: fullPath,
