@@ -62,6 +62,13 @@ import { getGlobalFileLockTable } from '../ai/fileLock'
 import type { ModelEntry, SchedulerChatParams } from '../ai/types'
 // ㊝ 放弃任务时丢弃未决暂存（变更从未落盘，与任务同生命周期）
 import { clearStaging } from './staging'
+// 自适应模型发现与调度：模型清单/角色选择完全由 Ollama 动态发现驱动
+import { pingOllama, listOllamaModels, listLoadedModels } from '../ai/modelDiscovery'
+import {
+  getFreeVram,
+  selectModelForRoleWithDiagnostics,
+  type ModelRole
+} from '../ai/adaptiveScheduler'
 
 // 待决审批请求表：id → 释放函数。前端应答 ai:permissionResponse 后放行对应工具
 const pendingPermissions = new Map<string, (r: UserPermissionResponse) => void>()
@@ -809,4 +816,35 @@ export function registerAiSchedulingHandlers(): void {
   // ---------- Agent 执行轨迹（录制回放，存 userData/traces/*.json） ----------
   ipcMain.handle('trace:list', () => listTraces(join(app.getPath('userData'), 'traces')))
   ipcMain.handle('trace:load', (_e, file: string) => loadTrace(join(app.getPath('userData'), 'traces'), file))
+
+  // ---------- 自适应模型发现（供前端状态栏展示） ----------
+  // 探测可用模型列表（Ollama 未启动时返回 ok:false）
+  ipcMain.handle('ai:listAvailableModels', async () => {
+    const ok = await pingOllama()
+    if (!ok) {
+      return { ok: false, error: 'Ollama 服务未启动，请先启动 Ollama', models: [] }
+    }
+    const models = await listOllamaModels()
+    return {
+      ok: true,
+      models: models.map((m) => ({
+        name: m.name,
+        family: m.family,
+        paramSize: m.paramSize,
+        quantization: m.quantization,
+        fileSizeGB: m.fileSizeGB,
+        isCoder: m.isCoder,
+        isMoE: m.isMoE
+      }))
+    }
+  })
+
+  // 诊断角色 → 模型的选择（UI 可展示为什么选了某模型 / 为什么没选）
+  ipcMain.handle('ai:diagnoseRoleSelection', async (_e, role: string) => {
+    const freeVram = await getFreeVram()
+    return selectModelForRoleWithDiagnostics(role as ModelRole, freeVram)
+  })
+
+  // 查询当前已加载模型（含显存占用）
+  ipcMain.handle('ai:listLoadedModels', async () => listLoadedModels())
 }

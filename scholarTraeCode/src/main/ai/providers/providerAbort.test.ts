@@ -79,6 +79,8 @@ describe('OllamaProvider abort（s28）', () => {
     const p = new OllamaProvider()
     // 跳过 ensure()（避免启动内嵌 Ollama）；fetch 已 mock，无需健康探测
     ;(p as any).healthy = true
+    // 模拟已通过 switchToRole 选择的激活模型（chat/chatStream 现在强依赖此字段）
+    ;(p as any).currentModelName = 'test-model'
     return p
   }
 

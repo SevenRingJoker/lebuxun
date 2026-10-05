@@ -427,6 +427,24 @@ const api = {
       ipcRenderer.invoke('ai:testProvider', providerId),
     getUsageStats: (): Promise<unknown> => ipcRenderer.invoke('ai:getUsageStats'),
     resetUsageStats: (): Promise<boolean> => ipcRenderer.invoke('ai:resetUsageStats'),
+    // ---- 自适应模型发现与调度（零硬编码，模型清单来自 Ollama 动态发现） ----
+    listAvailableModels: (): Promise<{
+      ok: boolean
+      error?: string
+      models: {
+        name: string
+        family: string
+        paramSize: number
+        quantization: string
+        fileSizeGB: number
+        isCoder: boolean
+        isMoE: boolean
+      }[]
+    }> => ipcRenderer.invoke('ai:listAvailableModels'),
+    listLoadedModels: (): Promise<{ name: string; sizeVramGB: number }[]> =>
+      ipcRenderer.invoke('ai:listLoadedModels'),
+    diagnoseRoleSelection: (role: string): Promise<unknown> =>
+      ipcRenderer.invoke('ai:diagnoseRoleSelection', role),
     // ---- 统一聊天调度 ----
     chatStream: (params: {
       model?: string

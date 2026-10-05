@@ -33,6 +33,45 @@ const scholar = useScholarStore()
 const { t } = useI18n()
 const input = ref('')
 
+// ---------- 自适应模型状态栏 ----------
+// 模型清单完全来自 Ollama 动态发现（ai:listAvailableModels），无任何硬编码模型名；
+// 当前激活模型随调度器 ai:modelCall 事件实时更新。
+const availableModelCount = ref(-1) // -1 = 尚未查询
+const modelQueryError = ref('')
+const activeModelName = ref('')
+const modelStatusText = computed(() => {
+  if (modelQueryError.value) return '⚠ Ollama 未启动'
+  if (availableModelCount.value === 0) return '⚠ 未检测到任何模型'
+  if (availableModelCount.value > 0) {
+    return activeModelName.value
+      ? `✓ 检测到 ${availableModelCount.value} 个模型 当前: ${activeModelName.value}`
+      : `✓ 检测到 ${availableModelCount.value} 个模型`
+  }
+  return ''
+})
+async function refreshAvailableModels(): Promise<void> {
+  try {
+    const res = await window.api.ai.listAvailableModels()
+    if (res.ok) {
+      availableModelCount.value = res.models.length
+      modelQueryError.value = ''
+    } else {
+      availableModelCount.value = -1
+      modelQueryError.value = res.error || 'Ollama 未启动'
+    }
+  } catch {
+    availableModelCount.value = -1
+    modelQueryError.value = 'Ollama 未启动'
+  }
+}
+onMounted(() => {
+  void refreshAvailableModels()
+  // 任务跑起来后按模型调用事件更新当前激活模型
+  window.api.ai.onModelCall((p) => {
+    if (p?.model) activeModelName.value = p.model
+  })
+})
+
 // ---------- 3.2 元素选择预填 ----------
 // 接收预览页采集的元素信息，预填「修改这个元素：...」
 const elementPick = ref<{
@@ -731,6 +770,14 @@ function autoResize(): void {
         </button>
         <span class="status-dot" :class="{ online: ws.ollamaReady }"
           :title="ws.ollamaReady ? 'Ollama 已连接' : 'Ollama 未连接'"></span>
+        <!-- 自适应模型状态：模型清单来自 Ollama 动态发现，当前模型随调度事件更新 -->
+        <span
+          v-if="modelStatusText"
+          class="model-status"
+          :class="{ warn: !!modelQueryError || availableModelCount === 0 }"
+          :title="modelStatusText"
+          >{{ modelStatusText }}</span
+        >
       </div>
     </div>
 
@@ -1134,6 +1181,20 @@ function autoResize(): void {
 .status-dot.online {
   background: var(--success);
   box-shadow: 0 0 6px var(--success);
+}
+
+/* 自适应模型状态文本：跟随头部状态点，超长省略 */
+.model-status {
+  font-size: 11px;
+  color: var(--text-dim, #8a93a6);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-status.warn {
+  color: var(--warning, #e6a23c);
 }
 
 .messages {

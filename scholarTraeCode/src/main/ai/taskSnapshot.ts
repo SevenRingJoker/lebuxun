@@ -14,7 +14,7 @@ import { deserializeStage, serializeStage } from './changeStage'
 export type TaskStatus = 'running' | 'paused' | 'completed' | 'aborted' | 'interrupted'
 
 /** 快照结构版本号：未来不兼容变更时 bump，旧文件 parse 直接放弃 */
-export const TASK_SCHEMA_VERSION = 1
+export const TASK_SCHEMA_VERSION = 2
 /**
  * 工具循环最大轮数（与 scheduler.MAX_TOOL_ROUNDS 保持一致）。
  * 此处独立声明而非反向 import scheduler，避免 scheduler ↔ taskSnapshot 循环依赖。
@@ -22,6 +22,9 @@ export const TASK_SCHEMA_VERSION = 1
 export const TASK_MAX_ROUNDS = 20
 /** 用户请求摘要最大长度（恢复条展示用，超出截断） */
 export const USER_REQUEST_LIMIT = 500
+
+/** 三模型模式角色（与 modelRegistry.ModelRole 对齐，独立声明避免反向依赖） */
+export type ActiveRole = 'planner' | 'executor' | 'coder'
 
 /** 序列化后的 PromptContext：createdFiles 由 Set 转为排序数组，可直接 JSON 化 */
 export interface SerializedPromptContext {
@@ -46,6 +49,14 @@ export interface SerializedPromptContext {
   directive: string | null
   artifactManifest: ArtifactManifest | null
   environmentReport: string
+  /** 三模型模式扩展：切换瞬间驻留角色 */
+  activeRole?: ActiveRole | null
+  /** 三模型模式扩展：DAG 运行态（serializeDagState 输出） */
+  dagState?: unknown
+  /** 三模型模式扩展：observer 失败计数状态 */
+  observerState?: unknown
+  /** 三模型模式扩展：最近 N 条工具结果（切换外化用） */
+  lastToolResults?: Array<[string, string]> | null
 }
 
 /** 任务前检查点绑定信息 */
@@ -168,8 +179,49 @@ export function serializeCtx(ctx: PromptContext): SerializedPromptContext {
     currentTodo: ctx.currentTodo ?? null,
     directive: ctx.directive ?? null,
     artifactManifest: ctx.artifactManifest ?? null,
-    environmentReport: ctx.environmentReport ?? ''
+    environmentReport: ctx.environmentReport ?? '',
+    // 三模型模式扩展字段（schema v2）
+    activeRole: ctx.activeRole ?? null,
+    dagState: ctx.dagState ?? null,
+    observerState: ctx.observerState ?? null,
+    lastToolResults: ctx.lastToolResults ?? null
   }
+}
+
+/** 三模型模式角色（与 modelRegistry.ModelRole 对齐，独立声明避免反向依赖） */
+export type ActiveRole = 'planner' | 'executor' | 'coder'
+
+/** 序列化后的 PromptContext：createdFiles 由 Set 转为排序数组，可直接 JSON 化 */
+export interface SerializedPromptContext {
+  workspace: string | null
+  currentFile: string | null
+  plan: string | null
+  isProjectCreation: boolean
+  createdFiles: string[]
+  ranNpmInstall: boolean
+  ranServe: boolean
+  ranMkdir: boolean
+  round: number
+  stallRestarts: number
+  agentsMd: string | null
+  rulesText: string | null
+  notesText: string
+  tools: Array<{ name: string; description?: string }>
+  mcpServers: string[]
+  skillsText: string | null
+  todosText: string
+  currentTodo: string | null
+  directive: string | null
+  artifactManifest: ArtifactManifest | null
+  environmentReport: string
+  /** 三模型模式扩展：切换瞬间驻留角色 */
+  activeRole?: ActiveRole | null
+  /** 三模型模式扩展：DAG 运行态（serializeDagState 输出） */
+  dagState?: unknown
+  /** 三模型模式扩展：observer 失败计数状态 */
+  observerState?: unknown
+  /** 三模型模式扩展：最近 N 条工具结果（切换外化用） */
+  lastToolResults?: Array<[string, string]> | null
 }
 
 /** 快照 ctx 还原为 PromptContext：createdFiles 数组 → 新 Set */
@@ -196,7 +248,57 @@ export function restoreCtx(data: SerializedPromptContext): PromptContext {
     currentTodo: data.currentTodo,
     directive: data.directive ?? undefined,
     artifactManifest: data.artifactManifest,
-    environmentReport: data.environmentReport
+    environmentReport: data.environmentReport,
+    // 三模型模式扩展字段（schema v2）
+    activeRole: data.activeRole ?? null,
+    dagState: data.dagState ?? null,
+    observerState: data.observerState ?? null,
+    lastToolResults: data.lastToolResults ?? null
+  }
+}
+
+/** 模型切换用的轻量外化：不落盘，只在内存中打包/还原 */
+export interface RoleSwitchBundle {
+  convoTail: AiMessage[]
+  ctxSlice: SerializedPromptContext
+  dagState: unknown
+}
+
+/** 打包切换外化：executor 上下文压缩到最近 tailRounds 轮（每轮=1 assistant + 1 tool） */
+export function packForSwitch(
+  ctx: PromptContext,
+  convo: AiMessage[],
+  dagState: unknown,
+  opts: { tailRounds: number }
+): RoleSwitchBundle {
+  // 保留 system + 首条 user + 最近 N 轮（assistant + tool 对）
+  const tail: AiMessage[] = []
+  const system = convo.find((m) => m.role === 'system')
+  if (system) tail.push(system)
+  const firstUser = convo.find((m) => m.role === 'user')
+  if (firstUser) tail.push(firstUser)
+  // 从末尾取最近 tailRounds 轮（assistant + tool 对）
+  const rounds: AiMessage[] = []
+  for (let i = convo.length - 1; i >= 0 && rounds.length < opts.tailRounds * 2; i--) {
+    if (convo[i].role === 'assistant' || convo[i].role === 'tool') {
+      rounds.unshift(convo[i])
+    }
+  }
+  return {
+    convoTail: [...tail, ...rounds],
+    ctxSlice: serializeCtx(ctx),
+    dagState
+  }
+}
+
+/** 还原切换外化：重建 convo + 恢复 ctx 切片 */
+export function unpackAfterSwitch(bundle: RoleSwitchBundle): {
+  convo: AiMessage[]
+  ctx: Partial<SerializedPromptContext>
+} {
+  return {
+    convo: bundle.convoTail,
+    ctx: bundle.ctxSlice
   }
 }
 

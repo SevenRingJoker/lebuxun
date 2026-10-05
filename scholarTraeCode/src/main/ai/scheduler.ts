@@ -21,6 +21,34 @@ import { compactIfNeeded, type Summarizer } from './contextCompactor'
 import { resolveCapabilities } from './modelCapabilities'
 import { estimateTokensText, computeHistoryBudget } from './tokenBudget'
 import { coerceToolArgs, dedupeBatchCalls, parseToolCallsFromContent } from './toolCall'
+// 三模型分时复用架构
+import {
+  switchModel,
+  safeSwitch,
+  currentRole,
+  currentChoice,
+  type ModelRole
+} from './modelRegistry'
+import { parseTaskDag, createDagState, readyNodes, checkOrderViolation, type TaskDag } from './taskDag'
+import { resolveVfsPath, roleEnvironmentHint, isThreeModelMode } from './virtualFs'
+import {
+  createObserverState,
+  noteReadFailure,
+  noteReadSuccess,
+  canTrigger,
+  buildObserverPrompt,
+  parseObserverVerdict,
+  serializeObserverState,
+  type ObserverState
+} from './observer'
+import { packForSwitch, unpackAfterSwitch, type RoleSwitchBundle } from './taskSnapshot'
+import {
+  checkDependencyClosure,
+  buildCoderRepairPrompt,
+  parseCoderPatches,
+  validatePatches
+} from './semanticValidator'
+import { inferPort, probeDevServer, buildRuntimeDiagnosis } from './runtimeValidator'
 import { TodoStore, type TodoItem, type TodoWriteArgs } from './todoManager'
 import { detectPlanDrift, formatDriftReport, type DriftReport } from './planDrift'
 import { listSkills, loadSkill, renderSkillList, recommendSkills } from './skills'
@@ -222,6 +250,13 @@ export class TaskBlockedError extends Error {
 async function resolveCandidates(taskType: TaskType, model?: string): Promise<string[]> {
   let models = getCachedModels()
   if (models.length === 0) models = await refreshModels()
+
+  // 三模型模式：候选回退循环 bypass，固定单候选 ollama（后续由 modelRegistry 角色切换接管具体模型）。
+  const availableIds = models.filter((m) => m.available).map((m) => m.id)
+  if (isThreeModelMode(availableIds)) {
+    return ['ollama:auto']
+  }
+
   const routed = route(taskType, models)
 
   let ids: string[]
@@ -497,6 +532,92 @@ manifest 的 rules 应覆盖本任务全部关键产物（如 package.json / src
     return res.ok ? res.content || null : null
   } catch {
     return null
+  }
+}
+
+/**
+ * 三模型模式：生成 DAG 执行计划（Planner 角色，14B）。
+ * 提示词要求输出 ```dag 代码块，包含 nodes/edges/complexity 字段。
+ * 失败时返回 null，调用方回退到现有 plan 文本模式。
+ */
+async function generateDagPlan(
+  strippedMessages: AiMessage[],
+  workspace: string | null | undefined,
+  events?: ToolsEvents,
+  environmentReport?: string,
+  recommendedSkills?: string[],
+  signal?: AbortSignal
+): Promise<{ ok: true; dag: TaskDag; targetDir: string | null } | { ok: false }> {
+  const lastUser = strippedMessages[strippedMessages.length - 1]
+  const envBlock = environmentReport ? `\n${environmentReport}` : ''
+  const skillBlock = recommendedSkills?.length
+    ? `\n匹配的技能（先 use_skill 加载）：${recommendedSkills.join('、')}`
+    : ''
+
+  const dagPrompt = `用户请求：${lastUser?.content ?? ''}
+工作区：${workspace ?? '未指定'}${envBlock}${skillBlock}
+
+请为这个项目制定 DAG 执行计划。输出格式：
+\`\`\`dag
+{
+  "version": 1,
+  "targetDir": "<项目子目录名，如 vue2-project>",
+  "nodes": [
+    {
+      "id": "n1",
+      "action": "write_file",
+      "args": { "path": "<相对路径>", "content": "<完整内容>" },
+      "dependencies": [],
+      "complexity": "low"
+    },
+    {
+      "id": "n2",
+      "action": "run_command",
+      "args": { "command": "npm install", "cwd": "<targetDir>" },
+      "dependencies": ["n1"],
+      "complexity": "low"
+    }
+  ]
+}
+\`\`\`
+
+要求：
+- 文件创建节点（write_file）complexity 按代码量标记：>200 行或复杂组件 → "high"（路由 Coder），否则 "low"（Executor 直接执行）
+- 依赖关系必须准确：npm install 依赖 package.json 创建节点；npm run serve 依赖 npm install 节点
+- 禁止全局安装命令（npm install -g 等）；禁止 npm init；必须用 write_file 直接写 package.json
+- Vue2 项目必须用 Vue 2 API（new Vue()），禁止 createApp`
+
+  // 切到 Planner
+  const sw = await safeSwitch('planner', { signal })
+  if (!sw.ok) {
+    events?.onFallback?.('planner', 'executor', sw.error)
+    return { ok: false }
+  }
+  // 自适应模式：直接用选择结果的模型名，构造 providerId 前缀
+  const plannerModelName = sw.choice.profile.name
+  events?.onModelCall?.(plannerModelName, '规划')
+
+  const providerId = 'ollama'
+  const modelName = plannerModelName
+  const provider = getProvider(providerId)
+  if (!provider) return { ok: false }
+
+  try {
+    const res = await provider.chat({
+      model: modelName,
+      messages: [{ role: 'user', content: dagPrompt }],
+      signal
+    })
+    trackChatUsage(`${providerId}:${modelName}`, res.usage, dagPrompt, res.content || '')
+    if (!res.ok || !res.content) return { ok: false }
+    const parsed = parseTaskDag(res.content)
+    if (!parsed.ok) {
+      events?.onFallback?.('dag-parse', 'plan-text', parsed.error)
+      return { ok: false }
+    }
+    return { ok: true, dag: parsed.dag, targetDir: parsed.dag.targetDir ?? null }
+  } catch {
+    return { ok: false }
   }
 }
 
@@ -1042,6 +1163,28 @@ async function runWithTools(
   /** ㊜ 1b 运行门：软暂停在安全点挂起本循环；不传则不可暂停 */
   gate?: TaskControlGate
 ): Promise<string> {
+  // ===== 三模型模式检测 =====
+  // 显存 14.4GB 约束下，PLANNER(14B)/EXECUTOR(8B)/CODER 分时复用。
+  // 检测方式：Ollama 可用模型清单中同时存在三个角色模型。
+  const cachedModels = getCachedModels()
+  const threeModelMode = isThreeModelMode(
+    cachedModels.filter((m) => m.available).map((m) => m.id)
+  )
+  if (threeModelMode) {
+    // 三模型模式：先切到 Planner 生成 DAG，再切回 Executor 执行
+    const dagResult = await generateDagPlan(messages, workspace, events, environmentReport, undefined, signal)
+    if (dagResult.ok) {
+      // DAG 驱动模式：用 DAG 替代现有 plan 文本，进入 DAG 执行循环
+      return runWithDag(
+        provider, modelName, messages, tools, events, workspace, dagResult.dag,
+        dagResult.targetDir, agentsMd, rulesText, notesText, currentFile, signal,
+        traceDir, environmentReport, taskControl, gate
+      )
+    }
+    // DAG 生成失败：降级到现有 plan 文本模式（generatePlan 已在下方调用）
+    events?.onFallback?.('dag', 'plan-text', 'DAG 生成失败，回退到文本计划')
+  }
+
   // ===== 运行时协调工具（todo_write / dispatch_subagents / list_skills / use_skill）=====
   // 这些工具带本次运行的闭包状态（TODO 清单、技能目录），不经过 MCP 层。
   const todoStore = new TodoStore()
@@ -2988,4 +3131,773 @@ export function validateTaskCompletion(ctx: PromptContext): string | null {
  */
 export function validateProjectCreation(ctx: PromptContext): string | null {
   return validateTaskCompletion(ctx)
+}
+
+// ==================== 三模型 DAG 驱动执行 ====================
+
+/**
+ * DAG 驱动执行循环（三模型模式）。
+ * Planner 已生成 DAG，Executor(8B) 按 ready 节点顺序执行，复杂节点路由 Coder。
+ */
+async function runWithDag(
+  provider: NonNullable<ReturnType<typeof getProvider>>,
+  modelName: string,
+  messages: AiMessage[],
+  tools: { server: string; tool: any }[],
+  events?: ToolsEvents,
+  workspace?: string | null,
+  dag?: TaskDag,
+  targetDir?: string | null,
+  agentsMd: string | null = null,
+  rulesText: string | null = null,
+  notesText: string = '',
+  currentFile: string | null = null,
+  signal?: AbortSignal,
+  traceDir?: string,
+  environmentReport: string = '',
+  taskControl?: TaskControlOptions,
+  gate?: TaskControlGate
+): Promise<string> {
+  if (!dag) return '错误：DAG 为空'
+
+  // 创建 DAG 运行态
+  const dagState = createDagState(dag)
+  const skills = await listSkills(workspace)
+  const recommendedSet = recommendSkills(
+    skills,
+    [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+  )
+
+  // 运行时协调工具（与 runWithTools 相同）
+  const todoStore = new TodoStore()
+  const runtimeTools: McpToolEntry[] = [
+    {
+      server: 'runtime',
+      tool: {
+        name: 'todo_write',
+        description: '任务规划与状态跟踪。',
+        inputSchema: { type: 'object', properties: { action: { type: 'string' } } }
+      }
+    },
+    {
+      server: 'runtime',
+      tool: {
+        name: 'list_skills',
+        description: '列出可用技能包。',
+        inputSchema: { type: 'object', properties: {} }
+      }
+    },
+    {
+      server: 'runtime',
+      tool: {
+        name: 'use_skill',
+        description: '加载技能包全文。',
+        inputSchema: { type: 'object', properties: { name: { type: 'string' } } }
+      }
+    }
+  ]
+  const allTools: McpToolEntry[] = [...runtimeTools, ...tools]
+  const runtimeNames = new Set(runtimeTools.map((t) => t.tool.name))
+
+  // 权限关卡
+  const askUser = (req: PermissionRequest): Promise<UserPermissionResponse> =>
+    events?.onPermissionRequest?.(req) ?? Promise.resolve({ decision: 'deny' as const, reason: '无审批通道' })
+  const permissionGate = new PermissionGate(workspace, askUser)
+
+  const runners: Record<string, (args: any) => Promise<string>> = {
+    todo_write: async (args: TodoWriteArgs) => {
+      const result = todoStore.handle(args)
+      ctx.todosText = todoStore.render()
+      events?.onTodo?.(todoStore.items)
+      return result
+    },
+    list_skills: async () =>
+      renderSkillList(skills, recommendedSet) || '暂无可用技能包',
+    use_skill: async (args) => {
+      const name = String(args?.name || '')
+      if (!skills.some((s) => s.name === name)) return `错误：未知技能 ${name}`
+      return loadSkill(workspace, name)
+    }
+  }
+
+  // 观察者状态：读取黑名单连击计数 + 干预防抖
+  const observerState = createObserverState()
+
+  // Agent 上下文
+  const ctx: PromptContext = {
+    workspace,
+    currentFile,
+    plan: JSON.stringify(dag), // DAG JSON 作为 plan
+    isProjectCreation: true,
+    createdFiles: new Set<string>(),
+    ranNpmInstall: false,
+    ranServe: false,
+    ranMkdir: false,
+    round: 0,
+    stallRestarts: 0,
+    agentsMd,
+    rulesText,
+    notesText,
+    mcpServers: listMcpServers(),
+    skillsText: renderSkillList(skills, recommendedSet),
+    todosText: '',
+    tools: allTools.map((t) => ({ name: t.tool.name, description: t.tool.description })),
+    artifactManifest: currentTaskManifest,
+    environmentReport,
+    targetDir: targetDir ?? null,
+    dagState: dagState,
+    observerState: serializeObserverState(observerState)
+  }
+  currentTaskCtx = ctx
+
+  // 对话历史
+  let convo: AiMessage[] = [...messages]
+  const executed = new Map<string, string>()
+  const failedReadPaths = new Set<string>()
+  const replanState = createReplanState()
+  let batchInterrupted = false
+  let blockedDrift: DriftReport | null = null
+  let lastContent = ''
+  // L4 运行时验证输入：最近一次 serve/dev/start 启动命令与输出（ranServe 置位时同步记录）
+  let lastServeCmd = ''
+  let lastServeOutput = ''
+
+  const taskId = `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const startedAt = Date.now()
+  const log = getLogger('scheduler')
+  log.info(`DAG 任务启动 taskId=${taskId} targetDir=${targetDir ?? '(root)'}`)
+
+  events?.onTaskControl?.({ taskId, phase: 'started', preTaskCheckpoint: taskControl?.preTaskCheckpoint ?? null })
+
+  // 切到 Executor
+  const sw = await safeSwitch('executor', { signal })
+  if (!sw.ok) {
+    return `错误：无法加载 Executor 模型：${sw.error}`
+  }
+  events?.onModelCall?.(sw.choice.profile.name, 'DAG 执行')
+
+  const ollamaTools = allTools.map((t) => ({
+    type: 'function',
+    function: {
+      name: t.tool.name,
+      description: t.tool.description || '',
+      parameters: t.tool.inputSchema ?? { type: 'object', properties: {} }
+    }
+  }))
+
+  const persist = (status: TaskStatus): void => {
+    if (!taskControl) return
+    void (async (): Promise<void> => {
+      const snapshot = buildTaskSnapshot(
+        {
+          taskId,
+          workspace: taskControl.workspace,
+          modelId: `${provider.id}:${modelName}`,
+          sessionId: taskControl.sessionId,
+          startRound: 0,
+          convo,
+          ctx,
+          todoSeq: todoStore.getSeq(),
+          todos: todoStore.items,
+          replan: replanState,
+          executed,
+          counters: { stallCount: 0, stallRestarts: 0, dedupStallCount: 0 },
+          preTaskCheckpoint: taskControl.preTaskCheckpoint,
+          stagedChanges: null,
+          startedAt
+        },
+        { status, updatedAt: Date.now() }
+      )
+      saveTaskSnapshot(taskControl.workspace, snapshot)
+    })().catch(() => {})
+  }
+
+  const finishByAbort = (): string => {
+    persist('aborted')
+    return (lastContent.trim() ? lastContent.trim() + '\n\n' : '') + '（任务已被用户中止）'
+  }
+
+  const finishBlocked = (drift: DriftReport): never => {
+    persist('interrupted')
+    const head =
+      '⛔ 任务已被系统强制中断：检测到关键产物缺失。\n' +
+      '请点击「重试任务」按固定流程补齐。\n' +
+      formatDriftReport(drift)
+    throw new TaskBlockedError(drift, (lastContent.trim() ? lastContent.trim() + '\n\n' : '') + head)
+  }
+
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      await gate?.parkIfPausing(signal)
+      if (signal?.aborted) return finishByAbort()
+
+      // 当前 ready 节点
+      const ready = readyNodes(dagState)
+      if (ready.length === 0) {
+        // 所有节点完成或失败
+        const failed = Object.entries(dagState.status).filter(([, s]) => s === 'failed')
+        if (failed.length > 0) {
+          const drift: DriftReport = {
+            items: failed.map(([id, s]) => ({
+              kind: 'missingArtifact',
+              severity: 'block',
+              detail: `节点 ${id} 执行失败：${dagState.results[id] ?? '未知错误'}`
+            })),
+            hasBlock: true,
+            hasWarn: false
+          }
+          finishBlocked(drift)
+        }
+        break // 全部完成
+      }
+
+      // 每轮重建系统提示词
+      ctx.round = round
+      ctx.stallRestarts = 0
+      ctx.currentTodo = ready.map((n) => `#${n.id} ${n.action}`).join('；')
+      ctx.roleHint = roleEnvironmentHint('executor', targetDir ?? null)
+
+      const agentSystem: AiMessage = { role: 'system', content: buildAgentPrompt(ctx) }
+      const compacted = await compactIfNeeded(convo, async (text) => {
+        try {
+          const res = await provider.chat({
+            model: modelName,
+            messages: [{ role: 'user', content: `请用一段纯中文摘要以下对话的关键信息：\n\n${text}` }],
+            signal
+          })
+          return res.ok ? (res.content ?? null) : null
+        } catch {
+          return null
+        }
+      }, { historyBudgetTokens: 4096 })
+
+      const current: AiMessage[] = [agentSystem, ...compacted]
+      events?.onModelCall?.(modelName, round === 0 ? '执行' : `第${round + 1}轮`)
+
+      const res = await provider.chat({
+        model: modelName,
+        messages: current,
+        tools: ollamaTools.length > 0 ? ollamaTools : undefined,
+        signal
+      })
+
+      if (!res.ok && (signal?.aborted || res.error === '已中止')) return finishByAbort()
+      if (!res.ok) throw new Error(res.error || '模型调用失败')
+
+      lastContent = res.content || ''
+      let toolCalls = (res.toolCalls as any[]) ?? []
+      if (toolCalls.length === 0) {
+        const parsed = parseToolCallsFromContent(lastContent, allTools)
+        if (parsed.length > 0) {
+          toolCalls = parsed
+          lastContent = ''
+        }
+      }
+      toolCalls = dedupeBatchCalls(toolCalls)
+
+      if (toolCalls.length === 0) {
+        // 无工具调用：检查是否全部完成
+        if (ready.length === 0) break
+        convo.push({ role: 'assistant', content: lastContent } as AiMessage)
+        convo.push({
+          role: 'user',
+          content: `当前就绪节点：${ready.map((n) => `${n.id}(${n.action})`).join('、')}。请继续执行。`
+        } as AiMessage)
+        continue
+      }
+
+      convo.push({ role: 'assistant', content: lastContent } as AiMessage)
+
+      // 执行工具调用
+      for (const tc of toolCalls) {
+        await gate?.parkIfPausing(signal)
+        if (signal?.aborted) break
+
+        const name = tc.function?.name
+        const rawArgs = tc.function?.arguments
+        let parsedArgs: any
+        try {
+          parsedArgs = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs
+        } catch {
+          parsedArgs = {}
+        }
+        let args = coerceToolArgs(parsedArgs, workspace)
+        const cmd = typeof args?.command === 'string' ? args.command : ''
+
+        // 运行时协调工具
+        if (runtimeNames.has(name)) {
+          events?.onToolCall?.(name, args)
+          const runtimeResult = await runners[name]?.(args) ?? `错误：运行时工具 ${name} 不可用`
+          convo.push({ role: 'tool', content: runtimeResult, name } as AiMessage)
+          events?.onToolResult?.(name, runtimeResult)
+          continue
+        }
+
+        // 路径劫持
+        if (args?.path && typeof args.path === 'string') {
+          const vfs = resolveVfsPath(args.path, workspace ?? '', targetDir)
+          if (!vfs.ok) {
+            const block = `错误：【路径劫持】${vfs.error}`
+            convo.push({ role: 'tool', content: block, name } as AiMessage)
+            events?.onToolResult?.(name, block)
+            continue
+          }
+          args.path = vfs.absPath
+        }
+
+        // 越序拦截
+        const violation = checkOrderViolation(dagState, name ?? '', args)
+        if (violation) {
+          noteFailure(replanState, 'preflightBlock', violation)
+          events?.onToolCall?.(name, args)
+          convo.push({ role: 'tool', content: violation, name } as AiMessage)
+          events?.onToolResult?.(name, violation)
+          continue
+        }
+
+        // 读取黑名单
+        if (READ_LIKE_TOOLS.has(name ?? '')) {
+          const target = readTargetOf(args)
+          if (target && failedReadPaths.has(target)) {
+            const block = `错误：【系统拦截】路径 ${target} 此前已确认不存在，禁止重复读取。`
+            noteFailure(replanState, 'preflightBlock', block)
+            events?.onToolCall?.(name, args)
+            convo.push({ role: 'tool', content: block, name } as AiMessage)
+            events?.onToolResult?.(name, block)
+
+            // 观察者干预：连续触发读取黑名单达阈值时，切到 14B 诊断
+            if (noteReadFailure(observerState, target)) {
+              log.warn(`[Observer] 读取黑名单连击触发，切换 14B 诊断：${target}`)
+              const intervention = await runObserverIntervention(
+                target,
+                convo,
+                ctx,
+                observerState,
+                provider,
+                signal
+              )
+              if (intervention) {
+                convo.push({ role: 'user', content: intervention } as AiMessage)
+                log.info(`[Observer] 干预指令已注入 convo`)
+              } else {
+                // 观察者干预失败（模型切换/诊断解析失败）也计入重规划信号
+                noteFailure(replanState, 'commandFailure', `观察者干预失败：${target}`)
+              }
+            }
+            continue
+          }
+        }
+
+        // 权限关卡
+        const gateResult = await permissionGate.check(name, args ?? {}, () => Promise.resolve())
+        if (!gateResult.allowed) {
+          const denied = `错误：操作未被允许：${gateResult.reason}。`
+          convo.push({ role: 'tool', content: denied, name } as AiMessage)
+          events?.onToolResult?.(name, denied)
+          continue
+        }
+
+        // 复杂度路由：write/edit 节点标记 complexity=high 时切换到 Coder 生成内容
+        const matchedReadyNode = ready.find((n) => n.action === name)
+        if (
+          matchedReadyNode &&
+          matchedReadyNode.complexity === 'high' &&
+          (name === 'write' || name === 'write_file' || name === 'edit')
+        ) {
+          const coderResult = await runCoderForNode(matchedReadyNode, args, ctx, targetDir ?? null, provider, signal)
+          if (coderResult) {
+            // Coder 产出内容：write 覆盖 args.content，edit 覆盖 args.new_string
+            args = { ...args, ...coderResult }
+            log.info(`[Coder] 节点 ${matchedReadyNode.id} 已切换 Coder 生成`)
+          } else {
+            log.warn(`[Coder] 节点 ${matchedReadyNode.id} Coder 生成失败，回退 Executor`)
+          }
+        }
+
+        // 执行工具
+        events?.onToolCall?.(name, args)
+        const found = allTools.find((t) => t.tool.name === name)
+        const result = found
+          ? await callMcpTool(found.server, name, args, workspace, signal)
+          : `错误：未找到工具 ${name}`
+
+        // 标记 DAG 节点状态
+        const matchedNode = ready.find((n) => n.action === name)
+        if (matchedNode) {
+          if (result.startsWith('错误') || result.startsWith('Error')) {
+            markFailed(dagState, matchedNode.id, result)
+          } else {
+            markDone(dagState, matchedNode.id, result)
+          }
+        }
+
+        convo.push({ role: 'tool', content: result, name } as AiMessage)
+        events?.onToolResult?.(name, result)
+
+        // 追踪 createdFiles
+        if ((name === 'write' || name === 'write_file') && args?.path) {
+          ctx.createdFiles.add(String(args.path))
+        }
+        if (name === 'bash' || name === 'run_terminal_command') {
+          if (/\bnpm\s+(install|i|ci)\b/.test(cmd)) ctx.ranNpmInstall = true
+          if (/\bnpm\s+run\s+(serve|dev|start)\b/.test(cmd)) {
+            ctx.ranServe = true
+            // 记录最近一次启动命令与输出，供 L4 运行时验证推断端口/打包诊断
+            lastServeCmd = cmd
+            lastServeOutput = result
+          }
+        }
+      }
+
+      if (batchInterrupted) break
+    }
+
+    // 收尾：验证锁
+    const validationMsg = validateTaskCompletion(ctx)
+    if (validationMsg) {
+      noteFailure(replanState, 'validationBlock', validationMsg)
+      const drift: DriftReport = {
+        items: [{ kind: 'missingArtifact', severity: 'block', detail: validationMsg }],
+        hasBlock: true,
+        hasWarn: false
+      }
+      finishBlocked(drift)
+    }
+
+    // L3 语义验证：依赖闭环检查（失败时 Coder 生成修复补丁走 staging）
+    const l3Result = await runSemanticValidation(ctx, workspace ?? '', targetDir ?? null, provider, signal)
+    if (l3Result) {
+      noteFailure(replanState, 'validationBlock', l3Result)
+      const drift: DriftReport = {
+        items: [{ kind: 'missingArtifact', severity: 'block', detail: l3Result }],
+        hasBlock: true,
+        hasWarn: false
+      }
+      finishBlocked(drift)
+    }
+
+    // L4 运行时验证：dev server 探测（失败时 14B 观察者在用户通道诊断）
+    if (ctx.ranServe && lastServeCmd) {
+      const l4Result = await runRuntimeValidation(
+        lastServeCmd,
+        lastServeOutput,
+        ctx,
+        workspace ?? '',
+        targetDir ?? null,
+        provider,
+        signal
+      )
+      if (l4Result) {
+        noteFailure(replanState, 'validationBlock', l4Result)
+        const drift: DriftReport = {
+          items: [{ kind: 'missingArtifact', severity: 'block', detail: l4Result }],
+          hasBlock: true,
+          hasWarn: false
+        }
+        finishBlocked(drift)
+      }
+    }
+
+    persist('completed')
+    return lastContent.trim() || '任务完成'
+  } catch (err) {
+    if (err instanceof TaskBlockedError) throw err
+    persist('aborted')
+    throw err
+  }
+}
+
+/**
+ * 安全切换包装：永不抛异常，失败返回 null；成功返回 SwitchResult。
+ * 所有 L2/L3/L4/Coder 路径通过本函数调用，保证「可捕获、可显示、可降级」。
+ */
+async function safeSwitchOrNull(
+  role: 'planner' | 'executor' | 'coder' | 'observer',
+  opts?: { signal?: AbortSignal }
+): Promise<Extract<Awaited<ReturnType<typeof safeSwitch>>, { ok: true }> | null> {
+  try {
+    const r = await safeSwitch(role, opts)
+    if (r.ok) return r
+    // 失败已通过 safeSwitch 内部 executor 兜底降级；此处仅日志
+    console.warn(`[TraeCode] safeSwitch(${role}) 失败:`, r.error)
+    return null
+  } catch (err) {
+    console.warn(`[TraeCode] safeSwitch(${role}) 异常:`, err instanceof Error ? err.message : err)
+    return null
+  }
+}
+
+/**
+ * 观察者干预：读取黑名单连击触发后，切换到 Planner(14B) 进行诊断。
+ * 返回注入 convo 的指令文本；诊断失败返回 null。
+ */
+async function runObserverIntervention(
+  failedPath: string,
+  convo: AiMessage[],
+  ctx: PromptContext,
+  observerState: ReturnType<typeof createObserverState>,
+  provider: NonNullable<ReturnType<typeof getProvider>>,
+  signal?: AbortSignal
+): Promise<string | null> {
+  // 打包失败轨迹（最近 6 条消息）
+  const trace = convo
+    .slice(-6)
+    .map((m) => `[${m.role}] ${typeof m.content === 'string' ? m.content.slice(0, 200) : ''}`)
+    .join('\n')
+  const ctxSummary = [
+    `已创建文件：${Array.from(ctx.createdFiles).slice(-5).join('、') || '(无)'}`,
+    `目标目录：${ctx.targetDir ?? '(根目录)'}`,
+    `观察者已触发：${observerState.triggerCount} 次`
+  ].join('\n')
+
+  // 切换到 Planner
+  const sw = await safeSwitchOrNull('planner', { signal })
+  if (!sw) return null
+  const plannerModel = sw.choice.profile.name
+
+  const prompt = buildObserverPrompt(failedPath, trace, ctxSummary)
+  const res = await provider.chat({
+    model: plannerModel,
+    messages: [
+      { role: 'system', content: '你是任务诊断专家，只输出 JSON 格式的诊断结论。' },
+      { role: 'user', content: prompt }
+    ],
+    signal
+  })
+
+  // 切回 Executor(8B)（失败不阻塞主流程）
+  await safeSwitchOrNull('executor', { signal })
+
+  if (!res.ok) return null
+  const verdict = parseObserverVerdict(res.content ?? '')
+  if (!verdict.ok) return null
+
+  if (verdict.verdict.kind === 'strategy') {
+    return `【观察者干预】${verdict.verdict.instruction}`
+  }
+  // codefix：注入修复指令（含目标文件清单）
+  const files = verdict.verdict.targetFiles.join('、')
+  return `【观察者干预】${verdict.verdict.instruction}\n需要修复的文件：${files}`
+}
+
+/**
+ * L3 语义验证：依赖闭环检查。
+ * 读取 targetDir 下 package.json 与已创建源码文件，提取 import/require 包名求差集。
+ * 有缺失时切换 Coder 生成修复补丁（完整文件内容），预检后走 staging 审阅通道落盘。
+ * @returns null = 通过/不适用；非 null = 阻断消息（finishBlocked 收尾）
+ */
+async function runSemanticValidation(
+  ctx: PromptContext,
+  workspace: string,
+  targetDir: string | null,
+  provider: NonNullable<ReturnType<typeof getProvider>>,
+  signal?: AbortSignal
+): Promise<string | null> {
+  if (!workspace) return null
+
+  // 1. 读取 package.json（不存在则跳过 L3）
+  const pkgVfs = resolveVfsPath('package.json', workspace, targetDir)
+  if (!pkgVfs.ok || !existsSync(pkgVfs.absPath)) return null
+  let pkgContent: string
+  try {
+    pkgContent = readFileSync(pkgVfs.absPath, 'utf-8')
+  } catch {
+    return null
+  }
+
+  // 2. 收集已创建源码文件内容（限 30 个，防上下文爆炸）
+  const SOURCE_EXTS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.vue'])
+  const files = new Map<string, string>()
+  for (const created of ctx.createdFiles) {
+    if (files.size >= 30) break
+    const ext = created.toLowerCase().match(/(\.[a-z0-9]+)$/)?.[1] ?? ''
+    if (!SOURCE_EXTS.has(ext)) continue
+    const vfs = resolveVfsPath(created, workspace, null) // createdFiles 已是绝对/工作区相对路径
+    const abs = vfs.ok ? vfs.absPath : created
+    try {
+      if (existsSync(abs)) {
+        const rel = targetDir && abs.includes(targetDir.replace(/\//g, sep))
+          ? abs.slice(abs.indexOf(targetDir.replace(/\//g, sep)) + targetDir.length + 1)
+          : abs
+        files.set(rel, readFileSync(abs, 'utf-8'))
+      }
+    } catch { /* 单文件读取失败跳过 */ }
+  }
+  if (files.size === 0) return null
+
+  // 3. 依赖闭环差集
+  const issues = checkDependencyClosure(files, pkgContent)
+  if (issues.length === 0) return null
+
+  // 4. 切换 Coder 生成修复补丁
+  const sw = await safeSwitchOrNull('coder', { signal })
+  if (!sw) return `L3 语义验证发现 ${issues.length} 个未声明依赖（${issues.map((i) => i.package).join('、')}），但 Coder 模型加载失败`
+  const coderModel = sw.choice.profile.name
+
+  const prompt = buildCoderRepairPrompt(issues, files)
+  const res = await provider.chat({
+    model: coderModel,
+    messages: [
+      { role: 'system', content: roleEnvironmentHint('coder', targetDir) },
+      { role: 'user', content: prompt }
+    ],
+    signal
+  })
+  // 切回 Executor（收尾前恢复驻留角色；失败不阻塞）
+  await safeSwitchOrNull('executor', { signal })
+
+  if (!res.ok) return `L3 语义验证：Coder 调用失败（${res.error}）。缺失依赖：${issues.map((i) => i.package).join('、')}`
+
+  // 5. 解析补丁 + 预检
+  const parsed = parseCoderPatches(res.content ?? '')
+  if (!parsed.ok) return `L3 语义验证：Coder 补丁解析失败（${parsed.error}）。缺失依赖：${issues.map((i) => i.package).join('、')}`
+
+  const check = await validatePatches(parsed.patches, { workspace, targetDir })
+  if (!check.ok) return `L3 语义验证：补丁预检未通过（${check.error}）`
+
+  // 6. 走 staging 审阅通道落盘
+  for (const patch of parsed.patches) {
+    const vfs = resolveVfsPath(patch.file, workspace, targetDir)
+    if (!vfs.ok) return `L3 语义验证：补丁路径越界（${patch.file}）`
+    const r = await commitStaged(workspace, { op: 'write', path: vfs.absPath, content: patch.content })
+    if (!r.ok) return `L3 语义验证：补丁落盘失败（${patch.file}）：${r.result}`
+  }
+  return null
+}
+
+/**
+ * L4 运行时验证：npm run serve 后探测 dev server 是否真正可访问。
+ * 流程：推断端口（vue.config.js devServer.port / vite 5173 / 缺省 8080）→ probeDevServer 轮询 →
+ *       失败时切 Planner(14B) 打包诊断文本，verdict 作为阻断原因由调用方 finishBlocked。
+ * @returns null = 探测通过；非 null = 阻断消息
+ */
+async function runRuntimeValidation(
+  serveCmd: string,
+  serveOutput: string,
+  ctx: PromptContext,
+  workspace: string,
+  targetDir: string | null,
+  provider: NonNullable<ReturnType<typeof getProvider>>,
+  signal?: AbortSignal
+): Promise<string | null> {
+  if (!workspace) return null
+
+  // 1. 读取 vue.config.js 推断端口
+  let vueConfigContent: string | null = null
+  const vueCfgVfs = resolveVfsPath('vue.config.js', workspace, targetDir)
+  if (vueCfgVfs.ok && existsSync(vueCfgVfs.absPath)) {
+    try {
+      vueConfigContent = readFileSync(vueCfgVfs.absPath, 'utf-8')
+    } catch { /* 读取失败按 null 处理 */ }
+  }
+  const port = inferPort(serveCmd, vueConfigContent)
+
+  // 2. 探测 dev server
+  const probe = await probeDevServer({ port, signal })
+  if (probe.ok) return null
+
+  // 3. 探测失败：切 Planner(14B) 在用户通道诊断
+  const sw = await safeSwitchOrNull('planner', { signal })
+  if (!sw) {
+    return `L4 运行时验证失败：dev server 在 ${port} 端口不可访问（${probe.error ?? '未知错误'}），且 Planner 模型加载失败`
+  }
+  const plannerModel = sw.choice.profile.name
+
+  const diagnosis = buildRuntimeDiagnosis(
+    probe,
+    serveCmd,
+    serveOutput,
+    Array.from(ctx.createdFiles)
+  )
+  const res = await provider.chat({
+    model: plannerModel,
+    messages: [
+      { role: 'system', content: '你是任务诊断专家，只输出 JSON 格式的诊断结论。' },
+      { role: 'user', content: diagnosis }
+    ],
+    signal
+  })
+
+  // 切回 Executor（保持驻留角色一致；失败不阻塞）
+  await safeSwitchOrNull('executor', { signal })
+
+  if (!res.ok) {
+    return `L4 运行时验证失败：dev server 在 ${port} 端口不可访问（${probe.error ?? '未知错误'}）。Planner 诊断调用失败：${res.error}`
+  }
+  const verdict = parseObserverVerdict(res.content ?? '')
+  if (!verdict.ok) {
+    return `L4 运行时验证失败：dev server 在 ${port} 端口不可访问（${probe.error ?? '未知错误'}）。Planner 诊断解析失败：${verdict.error}`
+  }
+  if (verdict.verdict.kind === 'strategy') {
+    return `L4 运行时验证失败（${port} 端口不可访问）：${verdict.verdict.instruction}`
+  }
+  const files = verdict.verdict.targetFiles.join('、')
+  return `L4 运行时验证失败（${port} 端口不可访问）：${verdict.verdict.instruction}\n需修复文件：${files}`
+}
+
+/**
+ * 复杂度路由：对标记 complexity='high' 的 write/edit 节点切换 Coder 生成内容。
+ * 返回需要合并到 args 的字段（如 content 或 new_string），生成失败返回 null。
+ */
+async function runCoderForNode(
+  node: import('./taskDag').DagNode,
+  args: Record<string, unknown>,
+  ctx: PromptContext,
+  targetDir: string | null,
+  provider: NonNullable<ReturnType<typeof getProvider>>,
+  signal?: AbortSignal
+): Promise<Record<string, unknown> | null> {
+  const path = String(args.path ?? '')
+  if (!path) return null
+
+  const sw = await safeSwitchOrNull('coder', { signal })
+  if (!sw) return null
+  const coderModel = sw.choice.profile.name
+
+  let prompt = ''
+  if (node.action === 'edit') {
+    const oldStr = String(args.old_string ?? '')
+    prompt = [
+      `【复杂编辑】请修改文件 ${path}：`,
+      '',
+      'old_string：',
+      '```',
+      oldStr || '(未指定)',
+      '```',
+      '',
+      '要求：输出修改后的完整文件内容（不使用 diff）。',
+      '格式：只返回文件正文，不要包裹代码块。'
+    ].join('\n')
+  } else {
+    prompt = [
+      `【复杂写入】请生成文件 ${path} 的完整内容。`,
+      '',
+      '节点描述：',
+      JSON.stringify(node.args, null, 2),
+      '',
+      '要求：输出完整文件内容，不要包裹代码块。'
+    ].join('\n')
+  }
+
+  const res = await provider.chat({
+    model: coderModel,
+    messages: [
+      { role: 'system', content: roleEnvironmentHint('coder', targetDir) },
+      { role: 'user', content: prompt }
+    ],
+    signal
+  })
+
+  // 切回 Executor
+  await safeSwitchOrNull('executor', { signal })
+
+  if (!res.ok || !res.content) return null
+
+  const content = res.content.trim()
+  if (!content) return null
+
+  if (node.action === 'edit') {
+    return { new_string: content }
+  }
+  return { content }
 }

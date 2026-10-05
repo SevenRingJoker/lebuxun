@@ -62,6 +62,14 @@ export interface PromptContext {
   environmentReport?: string
   /** ㊝ 审阅模式行为须知（getStageNotice 产出；缺省/关闭时不注入） */
   stageNoticeText?: string | null
+  /** 三模型模式扩展：当前驻留角色（scheduler 每轮注入） */
+  activeRole?: 'planner' | 'executor' | 'coder' | null
+  /** 三模型模式扩展：DAG 运行态（serializeDagState 输出） */
+  dagState?: unknown
+  /** 三模型模式扩展：observer 失败计数状态 */
+  observerState?: unknown
+  /** 三模型模式扩展：最近 N 条工具结果（切换外化用） */
+  lastToolResults?: Array<[string, string]> | null
   /** s43 spec 锚点清单文本（formatAnchorBlock 产出；无锚点时不注入） */
   anchorsText?: string | null
   /** s43 锚点违规累计（运行态，不进快照序列化；收尾报告用） */
