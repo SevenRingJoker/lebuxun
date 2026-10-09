@@ -504,8 +504,13 @@ async function generatePlan(
   const skillBlock = recommendedSkills && recommendedSkills.length > 0
     ? `\n匹配的内置/工作区技能（执行阶段第一步先调用 use_skill 加载，严格按技能中的规范与命令实施，不要凭空发挥）：${recommendedSkills.join('、')}`
     : ''
-  const planPrompt = `用户请求：${lastUser?.content ?? ''}
-工作区：${workspace ?? '未指定'}${envBlock}${skillBlock}
+  // ✅ 从原始用户请求识别项目类型，注入硬约束（替代硬编码 Vue2 全套要求）
+  const originalUserRequest = extractOriginalUserRequest(strippedMessages)
+  const projectType = detectProjectType(originalUserRequest)
+  const typeConstraint = projectTypeConstraint(projectType)
+  const typeBlock = typeConstraint ? `\n${typeConstraint}` : ''
+  const planPrompt = `用户请求：${originalUserRequest}
+工作区：${workspace ?? '未指定'}${envBlock}${skillBlock}${typeBlock}
 
 请为这个项目制定详细的文件创建计划。对每个文件，给出：
 1. 文件路径（相对于工作区根目录）
@@ -515,11 +520,8 @@ async function generatePlan(
 - 必须在计划第一行单独输出目标子目录：targetDir: <项目子目录名>（如 vue2-project），随后所有文件路径都必须位于该子目录下（如 vue2-project/package.json）；仅当工作区本身就是空项目目录时才允许输出 targetDir: .
 - 禁止依赖全局脚手架命令（vue create / create-react-app / npm init 等），所有文件必须用 write 工具直接写入完整内容
 - 严禁使用 npm init（含 -y/--yes）生成 package.json——必须直接 write 完整内容（含 name/scripts/dependencies）
-- Vue2 项目必须使用 Vue 2 API：new Vue()、new VueRouter()、new Vuex.Store()，禁止使用 Vue 3 的 createApp/createRouter
-- 必须包含：package.json、babel.config.js、vue.config.js、index.html、src/main.js、src/App.vue、src/router/index.js、src/store/index.js、src/components/HelloWorld.vue、README.md
-- package.json dependencies：vue@2.6.14, vue-router@3.5.1, vuex@3.6.2；devDependencies：@vue/cli-service, @vue/cli-plugin-babel, @vue/cli-plugin-router, @vue/cli-plugin-vuex
-- vue.config.js 配置 devServer.port 和路径别名
-- 项目必须能通过 npm install && npm run serve 正常运行
+- 严格遵循上方【强制约束】中的依赖版本与文件清单（若存在）；若无强制约束则按用户请求语义选择最合适的技术栈
+- 项目必须能通过其声明的启动命令（如 npm install && npm run serve / npm run dev）正常运行
 
 请按以下格式输出每个文件：
 === 文件: 相对路径 ===
@@ -557,6 +559,78 @@ manifest 的 rules 应覆盖本任务全部关键产物（如 package.json / src
 }
 
 /**
+ * 从用户请求文本识别项目类型（用于 DAG 提示词注入类型硬约束）。
+ * 与 detectProfileFromText 互补：那个返回完整 Profile，这个只返回类型字面量。
+ */
+function detectProjectType(userRequest: string): string {
+  const text = userRequest.toLowerCase()
+  if (/vue3|vue\s*3/.test(text)) return 'vue3'
+  if (/vue2|vue\s*2/.test(text)) return 'vue2'
+  if (/react/.test(text)) return 'react'
+  if (/node|express|koa/.test(text)) return 'node'
+  if (/python|flask|django/.test(text)) return 'python'
+  if (/go|golang/.test(text)) return 'go'
+  return 'unknown'
+}
+
+/**
+ * 从消息历史里反向查找「原始用户请求」：跳过 FORCED-RECOVERY / 系统强制 / 就绪节点
+ * 等系统注入消息与 DAG JSON 字面量。generateDagPlan / generatePlan 的类型识别必须
+ * 基于原始请求，否则重试时会被恢复消息带偏（典型：把恢复消息里的 node 描述误判为类型）。
+ */
+function extractOriginalUserRequest(strippedMessages: AiMessage[]): string {
+  const lastUser = strippedMessages[strippedMessages.length - 1]
+  const found = [...strippedMessages].reverse().find((m) => {
+    if (m.role !== 'user' || typeof m.content !== 'string') return false
+    const c = m.content
+    if (c.includes('FORCED-RECOVERY')) return false
+    if (c.includes('【系统强制')) return false
+    if (c.includes('就绪节点')) return false
+    if (c.trim().startsWith('{')) return false
+    return true
+  })
+  return found?.content ?? lastUser?.content ?? ''
+}
+
+/** 按项目类型生成 DAG 提示词的硬约束段（防止 Planner 跨类型复用模板） */
+function projectTypeConstraint(type: string): string {
+  switch (type) {
+    case 'vue3':
+      return `【强制约束】本次任务是 Vue 3 项目。必须使用：
+- dependencies: { "vue": "^3.4.0", "vue-router": "^4.3.0", "pinia": "^2.1.7" }
+- devDependencies: { "vite": "^5.4.21", "@vitejs/plugin-vue": "^5.1.0" }
+- scripts: { "dev": "vite", "build": "vite build" }
+- 必须创建：vite.config.js、index.html、src/main.js（用 createApp，禁止 new Vue()）、src/App.vue
+- targetDir 必须是 vue3-project
+- 禁止生成 node-project 或其他类型项目`
+    case 'vue2':
+      return `【强制约束】本次任务是 Vue 2 项目。必须使用：
+- dependencies: { "vue": "^2.7.16", "vue-router": "^3.6.5", "vuex": "^3.6.2" }
+- devDependencies: { "@vue/cli-service": "^5.0.8" }
+- scripts: { "serve": "vue-cli-service serve", "build": "vue-cli-service build" }
+- 必须创建：package.json、src/main.js（new Vue，禁止 createApp）、src/App.vue、public/index.html
+- targetDir 必须是 vue2-project
+- 禁止生成 vue3 / node / react 等其他类型项目`
+    case 'node':
+      return `【强制约束】本次任务是 Node.js 项目。必须使用：
+- scripts: { "start": "node src/index.js" }
+- 必须创建：package.json、src/index.js
+- targetDir 必须是 node-project
+- 禁止生成 vue / react 等前端项目`
+    case 'react':
+      return `【强制约束】本次任务是 React 项目。必须使用：
+- dependencies: { "react": "^18.3.1", "react-dom": "^18.3.1" }
+- devDependencies: { "vite": "^5.4.21", "@vitejs/plugin-react": "^4.3.0" }
+- scripts: { "dev": "vite", "build": "vite build" }
+- 必须创建：vite.config.js、index.html、src/main.jsx、src/App.jsx
+- targetDir 必须是 react-project
+- 禁止生成 vue / node 等其他类型项目`
+    default:
+      return ''
+  }
+}
+
+/**
  * 三模型模式：生成 DAG 执行计划（Planner 角色，14B）。
  * 提示词要求输出 ```dag 代码块，包含 nodes/edges/complexity 字段。
  * 失败时返回 null，调用方回退到现有 plan 文本模式。
@@ -575,9 +649,15 @@ async function generateDagPlan(
   const skillBlock = recommendedSkills?.length
     ? `\n匹配的技能（先 use_skill 加载）：${recommendedSkills.join('、')}`
     : ''
+  // ✅ 从原始用户请求识别项目类型（跳过 FORCED-RECOVERY / 系统强制 / 就绪节点等注入消息），
+  // 注入硬约束（防止 Planner 跨类型复用模板，典型：重试时被恢复消息带偏）
+  const originalUserRequest = extractOriginalUserRequest(strippedMessages)
+  const projectType = detectProjectType(originalUserRequest)
+  const typeConstraint = projectTypeConstraint(projectType)
+  const typeBlock = typeConstraint ? `\n${typeConstraint}` : ''
 
-  const dagPrompt = `用户请求：${lastUser?.content ?? ''}
-工作区：${workspace ?? '未指定'}${envBlock}${skillBlock}
+  const dagPrompt = `用户请求：${originalUserRequest}
+工作区：${workspace ?? '未指定'}${envBlock}${skillBlock}${typeBlock}
 
 请为这个项目制定 DAG 执行计划。输出格式：
 \`\`\`dag
@@ -619,7 +699,7 @@ async function generateDagPlan(
     {"id":"r1","action":"run_command","args":{"command":"npm run serve","cwd":"vue2-project"},"dependencies":["i1"]}
   ]}
 - 禁止全局安装命令（npm install -g 等）；禁止 npm init；必须用 write_file 直接写 package.json
-- Vue2 项目必须用 Vue 2 API（new Vue()），禁止 createApp`
+- 严格遵循上方【强制约束】中的框架 API 与依赖版本（若存在）`
 
   // 切到 Planner
   const sw = await safeSwitch('planner', { signal })
@@ -912,6 +992,9 @@ export async function scheduleChatWithTools(
     const text = m.content.toLowerCase()
     return !text.includes('.smoke-staging') && !text.includes('smoke-extra')
   })
+  // ✅ 新任务入口无条件清空上一次任务的 manifest，防止跨任务/跨类型污染
+  // （即使本次任务类型识别错误，也不会被上一次的 manifest 二次污染）
+  setValidationManifest(null)
   const role = taskTypeToModelRole(taskType)
 
   const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT
@@ -955,6 +1038,7 @@ export async function scheduleChatWithTools(
   // 规划阶段：项目创建请求先用 reasoning 模型生成详细计划
   let plan: string | null = null
   if (tools.length > 0 && isProjectCreation(strippedMessages)) {
+    // manifest 已在入口无条件清空，此处无需重复
     // 启动前清理历史失败运行残留的测试性垃圾文件（example.txt / test.txt 等）
     if (params.workspace) cleanupLeftoverJunk(params.workspace)
     plan = await generatePlan(strippedMessages, params.workspace, events, environmentReport, recommendedSkillNames, signal)
@@ -2866,10 +2950,18 @@ export function probeNpmGateContext(ctx: PromptContext, cwdArg: unknown): BashGa
   // 内容级校验：npm init -y 生成的空壳 package.json（无 dependencies）不能为 npm install 背书。
   // 仅磁盘文件可读时判定；读不到（未落盘/仅 createdFiles 登记）保持 undefined 不拦。
   let pkgHasContent: boolean | undefined
+  // ✅ 空依赖豁免：dependencies 与 devDependencies 全空的纯脚本项目（如工具脚本）
+  // 不需要 npm install，跳过 node_modules 检查
+  let pkgDepsEmpty = false
   const pkgPath = dirs.map((d) => join(d, 'package.json')).find((p) => safeExists(p))
   if (pkgPath) {
     try {
-      pkgHasContent = manifestContentOk(NODE_GATE_PROFILE, readFileSync(pkgPath, 'utf8'))
+      const raw = readFileSync(pkgPath, 'utf8')
+      pkgHasContent = manifestContentOk(NODE_GATE_PROFILE, raw)
+      const pkg = JSON.parse(raw) as { dependencies?: unknown; devDependencies?: unknown }
+      const hasDeps = Object.keys((pkg.dependencies as object) ?? {}).length > 0
+      const hasDevDeps = Object.keys((pkg.devDependencies as object) ?? {}).length > 0
+      pkgDepsEmpty = !hasDeps && !hasDevDeps
     } catch {
       pkgHasContent = undefined
     }
@@ -2881,7 +2973,7 @@ export function probeNpmGateContext(ctx: PromptContext, cwdArg: unknown): BashGa
     ranServe: ctx.ranServe,
     // 已创建（必须在探测目录内；含即将落盘的暂存场景）或磁盘真实存在
     packageJsonExists: pkgCreated || pkgOnDisk,
-    nodeModulesExists: nodeModulesOnDisk,
+    nodeModulesExists: nodeModulesOnDisk || pkgDepsEmpty,
     packageJsonHasContent: pkgHasContent
   }
 }
@@ -3633,6 +3725,11 @@ cwd: ${n.args?.cwd ?? '(工作区根)'}
         await gate?.parkIfPausing(signal)
         if (signal?.aborted) break
 
+        // ✅ 每次工具调用前重新计算 ready：上一个工具执行后可能已 markDone/markFailed，
+        // 用最新快照防止同批次多个工具重复匹配同一节点（典型：npm install 双调用）
+        const currentReady = readyNodes(dagState)
+        if (currentReady.length === 0) break
+
         const name = tc.function?.name
         const rawArgs = tc.function?.arguments
         let parsedArgs: any
@@ -3729,7 +3826,7 @@ cwd: ${n.args?.cwd ?? '(工作区根)'}
         }
 
         // 复杂度路由：write/edit 节点标记 complexity=high 时切换到 Coder 生成内容
-        const matchedReadyNode = ready.find((n) => {
+        const matchedReadyNode = currentReady.find((n) => {
           const allowedTools = DAG_ACTION_TO_TOOLS[n.action] ?? [n.action]
           return allowedTools.includes(name)
         })
@@ -3757,10 +3854,8 @@ cwd: ${n.args?.cwd ?? '(工作区根)'}
 
         // 标记 DAG 节点状态：用 action→工具名映射表匹配，再校验参数（path/command），
         // 防止 AI 调 write_file('example.txt') 却匹配到 package.json 节点被误标记完成。
-        // ✅ 每次工具执行前基于当前 ready 快照匹配；标记完成/失败后立即从快照移除，
-        // 防止同批次第二个工具（如同命令的 run_terminal_command + start_background_task）
-        // 复用旧快照重复匹配同一节点。
-        const matchedNode = ready.find((n) => {
+        // 匹配基于循环开头的 currentReady 快照（每次工具前重新计算）。
+        const matchedNode = currentReady.find((n) => {
           const allowedTools = DAG_ACTION_TO_TOOLS[n.action] ?? [n.action]
           if (!allowedTools.includes(name)) return false
 
@@ -3775,7 +3870,7 @@ cwd: ${n.args?.cwd ?? '(工作区根)'}
           return true
         })
         if (!matchedNode) {
-          const readyList = ready
+          const readyList = currentReady
             .map((n) => `${n.id}(${n.action}: ${n.args?.path ?? n.args?.command ?? '?'})`)
             .join('、')
           const block =
@@ -3786,8 +3881,6 @@ cwd: ${n.args?.cwd ?? '(工作区根)'}
           events?.onToolResult?.(name, block)
           continue
         }
-        // 从本批次 ready 快照中先移除（无论成败），确保同批次后续工具不再命中此节点
-        ready.splice(ready.indexOf(matchedNode), 1)
         if (result.startsWith('错误') || result.startsWith('Error')) {
           markFailed(dagState, matchedNode.id, result)
         } else {

@@ -385,7 +385,9 @@ export function buildForcedResetPrompt(profile: ProjectProfile, missingDetails: 
   const runText = profile.runCommands.join(' / ') || '对应运行命令'
   const forbidText = profile.forbidGlobalInstall.join('、') || '任何全局安装命令'
   return (
-    `【FORCED-RECOVERY】【系统强制重置】任务已作废，上下文已清理。当前项目类型是：${profile.displayName}（${profile.language}）。\n` +
+    // 不再写死项目类型（如「当前项目类型是：Node.js」）——避免误导后续 generateDagPlan
+    // 的类型识别；类型由 scheduler 从原始用户请求重新判定。
+    `【FORCED-RECOVERY】【系统强制重置】任务已作废，上下文已清理。\n` +
     '你必须严格遵循以下阶段顺序，不得有任何跳跃：\n' +
     `阶段一（文件生成）：只允许调用 write_file 创建基础文件。必须首先创建 ${manifest}，然后创建 ${configText}，最后创建 ${srcText}的源码。` +
     '禁止 read_text_file/read_file 读取旧文件（旧文件已视为污染状态），禁止 edit_file 修补，一律整体覆盖写入：\n' +

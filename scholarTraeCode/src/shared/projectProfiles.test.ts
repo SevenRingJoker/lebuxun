@@ -101,7 +101,8 @@ describe('buildForcedResetPrompt 系统强制重置话术', () => {
     const text = buildForcedResetPrompt(getProfile('python'), '- requirements.txt（依赖清单）')
     expect(text).toContain('【FORCED-RECOVERY】')
     expect(text).toContain('【系统强制重置】')
-    expect(text).toContain('当前项目类型是：Python（python）')
+    // 不再写死项目类型：类型由 scheduler 从原始用户请求重新判定
+    expect(text).not.toContain('当前项目类型是')
     expect(text).toContain('必须首先创建 requirements.txt')
     expect(text).toContain('pip install -r requirements.txt')
     expect(text).toContain('python main.py')
