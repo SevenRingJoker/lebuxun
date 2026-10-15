@@ -1,0 +1,42 @@
+# NovelForge Python Sidecar
+# 依赖清单对应 SPEC.md §13.2
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-forge-sidecar"
+version = "0.1.0"
+description = "NovelForge Python Sidecar：风格分析 / Embedding / RAG / 判别器 / 奖励模型"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "ollama>=0.4",
+    # 注意：sentence-transformers 体积大（依赖 torch），Phase 1 骨架默认不安装，
+    # 需要本地特征时手动 `pip install sentence-transformers`。
+    "sentence-transformers>=3.0",
+    "sqlite-vec>=0.1",
+    "numpy>=1.26",
+    "pydantic>=2.9",
+    "pypdf>=5.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
+]
+
+[tool.setuptools]
+# src layout：包位于 src/ 下
+package-dir = { "" = "src" }
+packages = ["novel_forge_sidecar"]
+
+[tool.pytest.ini_options]
+# 异步测试免打 marker
+asyncio_mode = "auto"
+testpaths = ["tests"]
