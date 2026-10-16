@@ -28,12 +28,19 @@ _AD_PATTERNS = [
 
 @dataclass
 class Chapter:
-    """切分后的章节。"""
+    """切分后的章节。
+
+    book_id / scene_types 由风格流水线在切分后回填：
+    - book_id：章节所属书籍 id（单书内 split_chapters 不感知书籍）；
+    - scene_types：与 paragraphs 对齐的场景标注结果（SceneType 取值字符串）。
+    """
 
     index: int
     title: str
     text: str
     paragraphs: list[str] = field(default_factory=list)
+    book_id: str = ""
+    scene_types: list[str] = field(default_factory=list)
 
 
 def split_chapters(text: str) -> list[Chapter]:

@@ -1,20 +1,20 @@
 """Embedding API：POST /embed → { vectors }。
 
-Phase 1 用 MockEmbedder（确定性伪随机向量），Ollama 可用后切换 OllamaEmbedder。
+Embedder 走 services/runtime 共享单例：Ollama 可用时用真实模型，
+否则回退 MockEmbedder（确定性伪随机向量）。
 """
 
 from fastapi import APIRouter
 
 from novel_forge_sidecar.models.schemas import EmbedRequest, EmbedResponse
-from novel_forge_sidecar.services.embedder import MockEmbedder
+from novel_forge_sidecar.services import runtime
 
 router = APIRouter(tags=["embed"])
-
-_embedder = MockEmbedder()
 
 
 @router.post("/embed", response_model=EmbedResponse)
 async def embed(req: EmbedRequest) -> EmbedResponse:
     """批量计算文本向量。"""
-    vectors = await _embedder.encode(req.texts)
+    embedder = await runtime.get_embedder()
+    vectors = await embedder.encode(req.texts)
     return EmbedResponse(vectors=vectors)

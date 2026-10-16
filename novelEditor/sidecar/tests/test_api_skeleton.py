@@ -124,11 +124,21 @@ async def _assert_sse_protocol(frames: list[dict]) -> None:
     assert frames[-1]["done"] is True
 
 
-async def test_style_analyze_sse(client: AsyncClient) -> None:
+async def test_style_analyze_sse(client: AsyncClient, tmp_path) -> None:
+    """真实流水线：写一个两章小书，验证 SSE 协议与 7 阶段齐全。"""
+    book = tmp_path / "书1.txt"
+    chapters = []
+    for i in range(1, 3):
+        paras = [
+            f"“出剑吧。”他冷声道。第{i}章第{j}段，剑光如雪，杀气冲天。"
+            for j in range(1, 7)
+        ]
+        chapters.append(f"第{i}章 试炼\n" + "\n".join(paras))
+    book.write_text("\n\n".join(chapters), encoding="utf-8")
     async with client.stream(
         "POST",
         "/style/analyze",
-        json={"authorName": "测试", "books": [{"title": "书1", "path": "a.txt"}]},
+        json={"authorName": "测试", "books": [{"title": "书1", "path": str(book)}]},
     ) as resp:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
@@ -141,20 +151,21 @@ async def test_style_analyze_sse(client: AsyncClient) -> None:
 
 
 async def test_reward_train_sse(client: AsyncClient) -> None:
+    """Phase 4.9 起训练要求 ≥100 样本，此处构造 100 条最小样本验证 SSE 协议。"""
+    samples = [
+        {
+            "projectId": "p1",
+            "context": "ctx",
+            "chosen": f"选中文本{i}，多一句。",
+            "rejected": f"落选{i}",
+            "reasons": [],
+        }
+        for i in range(100)
+    ]
     async with client.stream(
         "POST",
         "/reward/train",
-        json={
-            "samples": [
-                {
-                    "projectId": "p1",
-                    "context": "ctx",
-                    "chosen": "a",
-                    "rejected": "b",
-                    "reasons": [],
-                }
-            ]
-        },
+        json={"samples": samples},
     ) as resp:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")

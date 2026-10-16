@@ -12,7 +12,7 @@ import struct
 
 import numpy as np
 
-from novel_forge_sidecar.models.schemas import RagChunk, SceneType
+from novel_forge_sidecar.models.schemas import RagChunk, RagStats, SceneType
 
 
 def vector_to_blob(vec: list[float]) -> bytes:
@@ -113,6 +113,24 @@ class VectorStore:
             )
         scored.sort(key=lambda x: x[0], reverse=True)
         return [chunk for _, chunk in scored[:top_k]]
+
+    def stats(self, style_id: str) -> RagStats:
+        """统计某个风格的 chunk 总量与按场景分布。"""
+        by_scene: dict[str, int] = {}
+        total = 0
+        for scene, count in self.conn.execute(
+            "SELECT scene_type, COUNT(*) FROM rag_chunks WHERE style_id = ? GROUP BY scene_type",
+            (style_id,),
+        ):
+            by_scene[scene] = int(count)
+            total += int(count)
+        return RagStats(total_chunks=total, by_scene=by_scene)
+
+    def delete_style(self, style_id: str) -> int:
+        """删除某个风格的全部向量行，返回删除条数。"""
+        cur = self.conn.execute("DELETE FROM rag_chunks WHERE style_id = ?", (style_id,))
+        self.conn.commit()
+        return cur.rowcount
 
     def close(self) -> None:
         self.conn.close()

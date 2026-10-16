@@ -1,0 +1,39 @@
+{
+  "name": "主循环",
+  "version": 1,
+  "nodes": [
+    { "id": "ctx",   "type": "input.context",            "position": { "x": 0,    "y": 240 }, "params": {} },
+    { "id": "mem",   "type": "context.memory",           "position": { "x": 220,  "y": 120 }, "params": {} },
+    { "id": "style", "type": "context.style",            "position": { "x": 220,  "y": 360 }, "params": {} },
+    { "id": "plan",  "type": "generate.chapter-plan",    "position": { "x": 440,  "y": 240 }, "params": {} },
+    { "id": "rag",   "type": "style.rag-retrieve",      "position": { "x": 440,  "y": 480 }, "params": {} },
+    { "id": "gen",   "type": "generate.paragraph-multi", "position": { "x": 660,  "y": 240 }, "params": { "candidateCount": 3, "strategyMode": "gradient" } },
+    { "id": "disc",  "type": "style.discriminator",      "position": { "x": 880,  "y": 240 }, "params": {} },
+    { "id": "pick",  "type": "review.candidate-picker",  "position": { "x": 1100, "y": 240 }, "params": {} },
+    { "id": "acc",   "type": "chapter.accumulator",      "position": { "x": 1320, "y": 240 }, "params": {} },
+    { "id": "endq",  "type": "review.chapter-end",       "position": { "x": 1540, "y": 240 }, "params": {} },
+    { "id": "fin",   "type": "chapter.finalizer",        "position": { "x": 1760, "y": 120 }, "params": {} },
+    { "id": "memup", "type": "memory.updater",           "position": { "x": 1980, "y": 120 }, "params": {} },
+    { "id": "next",  "type": "chapter.next-starter",     "position": { "x": 2200, "y": 120 }, "params": {} }
+  ],
+  "edges": [
+    { "id": "e1",  "source": { "nodeId": "ctx",   "port": "context" },      "target": { "nodeId": "mem",   "port": "context" } },
+    { "id": "e2",  "source": { "nodeId": "ctx",   "port": "context" },      "target": { "nodeId": "style", "port": "context" } },
+    { "id": "e3",  "source": { "nodeId": "ctx",   "port": "context" },      "target": { "nodeId": "plan",  "port": "context" } },
+    { "id": "e4",  "source": { "nodeId": "mem",   "port": "memory" },       "target": { "nodeId": "plan",  "port": "memory" } },
+    { "id": "e17", "source": { "nodeId": "plan",  "port": "plan" },         "target": { "nodeId": "rag",   "port": "plan" } },
+    { "id": "e18", "source": { "nodeId": "rag",   "port": "fewshot" },      "target": { "nodeId": "gen",   "port": "fewshot" } },
+    { "id": "e19", "source": { "nodeId": "rag",   "port": "plan" },         "target": { "nodeId": "gen",   "port": "plan" } },
+    { "id": "e6",  "source": { "nodeId": "mem",   "port": "memory" },       "target": { "nodeId": "gen",   "port": "memory" } },
+    { "id": "e7",  "source": { "nodeId": "style", "port": "stylePrompt" },  "target": { "nodeId": "gen",   "port": "stylePrompt" } },
+    { "id": "e8",  "source": { "nodeId": "gen",   "port": "candidates" },   "target": { "nodeId": "disc",  "port": "candidates" } },
+    { "id": "e9",  "source": { "nodeId": "disc",  "port": "scored" },       "target": { "nodeId": "pick",  "port": "candidates" } },
+    { "id": "e10", "source": { "nodeId": "pick",  "port": "selected" },     "target": { "nodeId": "acc",   "port": "selected" } },
+    { "id": "e11", "source": { "nodeId": "acc",   "port": "chapterDraft" }, "target": { "nodeId": "endq",  "port": "chapterDraft" } },
+    { "id": "e12", "source": { "nodeId": "endq",  "port": "decision" },     "target": { "nodeId": "gen",   "port": "trigger" }, "condition": { "port": "decision", "equals": "continue" } },
+    { "id": "e13", "source": { "nodeId": "endq",  "port": "chapterDraft" }, "target": { "nodeId": "fin",   "port": "chapterDraft" }, "condition": { "port": "decision", "equals": "end" } },
+    { "id": "e14", "source": { "nodeId": "fin",   "port": "memoryUpdate" }, "target": { "nodeId": "memup", "port": "memoryUpdate" } },
+    { "id": "e15", "source": { "nodeId": "memup", "port": "memory" },       "target": { "nodeId": "next",  "port": "memory" } },
+    { "id": "e16", "source": { "nodeId": "next",  "port": "context" },      "target": { "nodeId": "plan",  "port": "context" } }
+  ]
+}

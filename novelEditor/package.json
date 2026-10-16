@@ -1,0 +1,32 @@
+{
+  "name": "novel-forge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "成长型小说生成桌面软件（Electron + React + Python Sidecar + Ollama）",
+  "workspaces": [
+    "apps/main",
+    "apps/renderer",
+    "apps/shared"
+  ],
+  "scripts": {
+    "dev": "concurrently -n main,renderer -c blue,green \"npm run dev -w apps/main\" \"npm run dev -w apps/renderer\"",
+    "build": "npm run build -w apps/shared && npm run build -w apps/main && npm run build -w apps/renderer",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3",
+    "rebuild:node": "npm rebuild better-sqlite3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.0",
+    "concurrently": "^9.1.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true,
+    "electron@33.4.11": true,
+    "esbuild@0.24.2": true,
+    "esbuild@0.21.5": true
+  }
+}

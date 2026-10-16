@@ -1,0 +1,28 @@
+{
+  "name": "@novel-forge/main",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NovelForge Electron 主进程",
+  "main": "dist/index.cjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs && electron .",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@novel-forge/shared": "*",
+    "better-sqlite3": "^12",
+    "nanoid": "^5",
+    "ollama": "^0.5",
+    "umzug": "^3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7",
+    "@types/node": "^24",
+    "electron": "^33",
+    "esbuild": "^0.24",
+    "typescript": "^5.6",
+    "vitest": "^2"
+  }
+}

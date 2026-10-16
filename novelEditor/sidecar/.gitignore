@@ -7,3 +7,9 @@ __pycache__/
 build/
 dist/
 .venv/
+
+# 训练产物（奖励模型 / 演化模板）
+models/
+
+# 运行时数据（风格档案 / RAG 向量库 / 判别器模型）
+data/

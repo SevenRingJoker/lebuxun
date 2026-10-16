@@ -211,15 +211,79 @@ class DiscriminatorScoreResponse(CamelModel):
 
 
 class RewardScoreRequest(CamelModel):
-    features: list[list[float]]
+    """打分请求：可直接传特征向量，或传 texts 由服务端提取特征（两者至少其一）。"""
+
+    features: list[list[float]] = Field(default_factory=list)
+    texts: Optional[list[str]] = None
 
 
 class RewardScoreResponse(CamelModel):
     scores: list[float]
+    model_version: Optional[str] = None
 
 
 class RewardTrainRequest(CamelModel):
     samples: list[PreferenceSample]
+
+
+class RewardStatusResponse(CamelModel):
+    """奖励模型状态：版本 + 最近一次训练指标。未训练时全为 None。"""
+
+    version: Optional[str] = None
+    accuracy: Optional[float] = None
+    kendall_tau: Optional[float] = None
+    sample_count: Optional[int] = None
+    trained_at: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# 演化模式学习 / 提示词进化（SPEC §10.4 / §10.5，任务 4.10 / 4.11）
+# ---------------------------------------------------------------------------
+
+
+class EvolutionTemplate(CamelModel):
+    """改进模板：chosen vs rejected 特征差提炼出的规则。"""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    name: str
+    description: str = ""
+    instruction: str = ""
+    feature_deltas: dict[str, float] = Field(default_factory=dict)
+    support: int = 0
+    confidence: float = 0.0
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+
+
+class ExtractTemplatesRequest(CamelModel):
+    samples: list[PreferenceSample]
+
+
+class ExtractTemplatesResponse(CamelModel):
+    templates: list[EvolutionTemplate]
+    message: str = ""
+
+
+class PromptTemplate(CamelModel):
+    """提示词版本（SPEC §10.5）。"""
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    node_type: str = "generate"
+    project_id: Optional[str] = None
+    version: int
+    parent_version: Optional[int] = None
+    content: str
+    based_on: list[str] = Field(default_factory=list)
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+
+
+class PromptTemplateCreateRequest(CamelModel):
+    node_type: str = "generate"
+    base_template: str
+    project_id: Optional[str] = None
+
+
+class PromptTemplateListResponse(CamelModel):
+    templates: list[PromptTemplate]
 
 
 class SceneClassifyRequest(CamelModel):

@@ -18,6 +18,7 @@ from novel_forge_sidecar import __version__
 from novel_forge_sidecar.api import (
     discriminator,
     embed,
+    evolution,
     health,
     lora,
     rag,
@@ -35,6 +36,7 @@ app.include_router(embed.router)
 app.include_router(rag.router)
 app.include_router(discriminator.router)
 app.include_router(reward.router)
+app.include_router(evolution.router)
 app.include_router(scene.router)
 app.include_router(lora.router)
 

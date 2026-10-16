@@ -1,0 +1,33 @@
+{
+  "name": "@novel-forge/shared",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NovelForge 共享类型 / 常量 / Zod schema",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schemas": {
+      "types": "./dist/schemas/index.d.ts",
+      "default": "./dist/schemas/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^3.24",
+    "zod-to-json-schema": "^3.23"
+  },
+  "devDependencies": {
+    "typescript": "^5.6"
+  }
+}
